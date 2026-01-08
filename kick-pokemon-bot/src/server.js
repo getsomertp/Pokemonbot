@@ -14,32 +14,110 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- Basic health / uptime routes ---
-app.get("/health", (req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
-app.get("/", (req, res) => res.status(200).send("ok"));
-
 const PORT = Number(process.env.PORT || 3000);
 const PREFIX = process.env.COMMAND_PREFIX || "!";
 const KICK_CHANNEL = process.env.KICK_CHANNEL;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 const STREAMER_USERNAME = (process.env.STREAMER_USERNAME || KICK_CHANNEL || "").toLowerCase();
 
-if (!KICK_CHANNEL) {
-  console.error("Missing KICK_CHANNEL in env.");
-}
-
 const game = new Game();
 
-// ---------- DB bootstrap (Railway friendly) ----------
+// ---- Readiness / health (prevents Railway 502 confusion) ----
+let READY = false;
+let BOOT_ERROR = null;
+
+app.get("/health", (req, res) => {
+  if (READY) return res.status(200).json({ ok: true, ready: true, ts: Date.now() });
+  return res.status(503).json({
+    ok: false,
+    ready: false,
+    ts: Date.now(),
+    error: BOOT_ERROR ? String(BOOT_ERROR) : "booting"
+  });
+});
+
+app.get("/", (req, res) => res.status(200).send("ok"));
+
+process.on("unhandledRejection", (e) => {
+  console.error("UNHANDLED REJECTION:", e);
+});
+process.on("uncaughtException", (e) => {
+  console.error("UNCAUGHT EXCEPTION:", e);
+});
+
+// ---------- DB bootstrap ----------
 function ensureDbSchema() {
+  console.log("Running: npx prisma db push");
+  execSync("npx prisma db push", { stdio: "inherit" });
+  console.log("✅ prisma db push complete");
+}
+
+// ---------- Kick OAuth token auto-refresh ----------
+async function refreshKickTokenIfNeeded({ force = false } = {}) {
   try {
-    console.log("Running: npx prisma db push");
-    execSync("npx prisma db push", { stdio: "inherit" });
-    console.log("✅ prisma db push complete");
+    const client_id = process.env.KICK_CLIENT_ID;
+    const client_secret = process.env.KICK_CLIENT_SECRET;
+    if (!client_id || !client_secret) return;
+
+    const refreshToken = await getSetting("kick_refresh_token");
+    if (!refreshToken) return;
+
+    const expStr = await getSetting("kick_access_expires_at");
+    const expMs = Number(expStr || 0);
+
+    const now = Date.now();
+    const skewMs = 2 * 60 * 1000; // refresh if expiring within 2 min
+    const shouldRefresh = force || !expMs || expMs - now <= skewMs;
+    if (!shouldRefresh) return;
+
+    console.log("Refreshing Kick access token...");
+
+    const tokenUrl = "https://id.kick.com/oauth/token";
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id,
+      client_secret,
+      refresh_token: refreshToken
+    });
+
+    const resp = await fetch(tokenUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      console.error(`❌ Kick token refresh failed: ${resp.status} ${resp.statusText}`);
+      if (text) console.error(text);
+      return;
+    }
+
+    const data = await resp.json();
+
+    const access = data.access_token;
+    const newRefresh = data.refresh_token || refreshToken;
+    const expiresIn = Number(data.expires_in || 3600);
+    const newExpMs = Date.now() + expiresIn * 1000;
+
+    if (!access) {
+      console.error("❌ Kick token refresh response missing access_token");
+      return;
+    }
+
+    await setSetting("kick_access_token", access);
+    await setSetting("kick_refresh_token", newRefresh);
+    await setSetting("kick_access_expires_at", String(newExpMs));
+
+    console.log("✅ Kick access token refreshed");
   } catch (e) {
-    console.error("❌ prisma db push failed (check DATABASE_URL / Postgres plugin)");
-    throw e;
+    console.error("Token refresh error:", e?.message || e);
   }
+}
+
+function startTokenRefreshLoop() {
+  refreshKickTokenIfNeeded().catch(() => {});
+  setInterval(() => refreshKickTokenIfNeeded().catch(() => {}), 60 * 1000);
 }
 
 // ---------- Spawns ----------
@@ -48,10 +126,11 @@ async function announceSpawn(spawn) {
   const msg = `A wild ${spawn.pokemon} appeared (${spawn.tier})${shinyTag}! Type ${PREFIX}catch ${spawn.pokemon}`;
 
   try {
+    await refreshKickTokenIfNeeded();
     const res = await sendKickChatMessage(msg);
     if (!res?.ok) console.log("send message failed:", res);
   } catch (e) {
-    console.error("announceSpawn failed (likely bot not authorized yet):", e?.message || e);
+    console.error("announceSpawn failed:", e?.message || e);
   }
 }
 
@@ -83,7 +162,6 @@ app.get("/auth/kick/start", async (req, res) => {
   const state = makeState();
   await setSetting("kick_oauth_state", state);
 
-  // scopes needed for bot chat sending
   const scope = encodeURIComponent("chat:write");
   const redirectUri = encodeURIComponent(`${PUBLIC_BASE_URL}/auth/kick/callback`);
 
@@ -150,7 +228,9 @@ app.get("/auth/kick/callback", async (req, res) => {
     await setSetting("kick_refresh_token", refresh);
     await setSetting("kick_access_expires_at", String(expMs));
 
-    res.send("✅ Bot account authorized! Restart the service (or wait a moment) and the bot can send chat.");
+    await refreshKickTokenIfNeeded({ force: false });
+
+    res.send("✅ Bot account authorized! You can close this tab.");
   } catch (e) {
     console.error("OAuth callback error:", e);
     res.status(500).send("OAuth callback failed (see server logs).");
@@ -192,7 +272,6 @@ async function handleChat({ username, userId, content }) {
 
   const lower = msg.toLowerCase();
 
-  // !catch <name>
   if (lower.startsWith(`${PREFIX}catch `)) {
     const guess = msg.slice(`${PREFIX}catch `.length);
     const result = await game.tryCatch({
@@ -202,20 +281,21 @@ async function handleChat({ username, userId, content }) {
     });
 
     if (!result.ok) {
-      if (result.reason === "wrong_name") return; // silent miss
+      if (result.reason === "wrong_name") return;
       if (result.reason === "no_spawn") {
         try {
-          await sendKickChatMessage(`No Pokémon active right now.`);
+          await refreshKickTokenIfNeeded();
+          await sendKickChatMessage("No Pokémon active right now.");
         } catch {}
         return;
       }
-      if (result.reason === "already_caught") return;
       return;
     }
 
     const s = result.spawn;
     const shinyTag = s.isShiny ? " ✨SHINY✨" : "";
     try {
+      await refreshKickTokenIfNeeded();
       await sendKickChatMessage(
         `${username} caught ${s.pokemon}${shinyTag} for ${result.catch.pointsEarned} pts!`
       );
@@ -225,17 +305,18 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
-  // !lb / !leaderboard
   if (lower === `${PREFIX}lb` || lower === `${PREFIX}leaderboard`) {
     const lb = await game.leaderboard(10);
     if (!lb.length) {
       try {
+        await refreshKickTokenIfNeeded();
         await sendKickChatMessage("No points yet.");
       } catch {}
       return;
     }
     const line = lb.map((r) => `${r.rank}. ${r.name}: ${r.points}`).join(" | ");
     try {
+      await refreshKickTokenIfNeeded();
       await sendKickChatMessage(`🏆 Points Leaderboard — ${line}`);
     } catch (e) {
       console.error("sendKickChatMessage failed:", e?.message || e);
@@ -243,16 +324,17 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
-  // !me
   if (lower === `${PREFIX}me`) {
     const stats = await game.userStats(username);
     if (!stats) {
       try {
+        await refreshKickTokenIfNeeded();
         await sendKickChatMessage(`${username}: no stats yet. Catch something!`);
       } catch {}
       return;
     }
     try {
+      await refreshKickTokenIfNeeded();
       await sendKickChatMessage(
         `${stats.name} — ${stats.points} pts | ${stats.catches} catches | ✨${stats.shinies}`
       );
@@ -262,7 +344,6 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
-  // !spawn (streamer-only)
   if (lower === `${PREFIX}spawn`) {
     if (String(username || "").toLowerCase() !== STREAMER_USERNAME) return;
     const s = await game.spawn();
@@ -272,37 +353,38 @@ async function handleChat({ username, userId, content }) {
 }
 
 // ---------- Start everything ----------
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log(`Server listening on ${PORT}`);
 
-  // DB must work; if it doesn't, exit so the platform restarts the service
-  try {
-    ensureDbSchema();
-    await prisma.$queryRaw`SELECT 1`;
-  } catch (e) {
-    console.error("DB bootstrap failed:", e);
-    process.exit(1);
-  }
-
-  // Kick reader (pure WS version from Option A; no Playwright)
-  if (KICK_CHANNEL) {
+  // Start loops AFTER server is listening (prevents 502)
+  (async () => {
     try {
-      startKickReader({
-        channel: KICK_CHANNEL,
-        onChat: handleChat,
-        onStatus: (s) => console.log(s),
-        onError: (e) => console.error(e)
-      });
-    } catch (e) {
-      console.error("Kick reader failed to start:", e);
-    }
-  }
+      ensureDbSchema();
+      await prisma.$queryRaw`SELECT 1`;
+      startTokenRefreshLoop();
 
-  // Spawn loop (do not crash server if bot isn't authorized yet)
-  try {
-    await spawnLoop();
-  } catch (e) {
-    console.error("spawnLoop failed (likely missing Kick auth tokens):", e);
-    console.error("Authorize bot at /auth/kick/start then restart the service.");
-  }
+      if (KICK_CHANNEL) {
+        startKickReader({
+          channel: KICK_CHANNEL,
+          onChat: handleChat,
+          onStatus: (s) => console.log(s),
+          onError: (e) => console.error(e)
+        });
+      }
+
+      try {
+        await spawnLoop();
+      } catch (e) {
+        console.error("spawnLoop failed (likely missing Kick auth tokens):", e);
+      }
+
+      READY = true;
+      BOOT_ERROR = null;
+      console.log("✅ READY");
+    } catch (e) {
+      BOOT_ERROR = e?.message || e;
+      READY = false;
+      console.error("❌ Boot failed (server still up for /health):", e);
+    }
+  })();
 });
