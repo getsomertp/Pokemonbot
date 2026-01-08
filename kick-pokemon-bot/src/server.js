@@ -4,6 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const { execSync } = require("child_process");
 const crypto = require("crypto");
+const cookieParser = require("cookie-parser");
 
 const { prisma } = require("./prisma");
 const { Game } = require("./game");
@@ -16,6 +17,7 @@ app.set("trust proxy", 1); // IMPORTANT for Railway (correct https in req.protoc
 
 app.use(cors());
 app.use(express.json());
+app.use(cookieParser(process.env.COOKIE_SECRET || "dev_cookie_secret"));
 
 const PORT = Number(process.env.PORT || 3000);
 const PREFIX = process.env.COMMAND_PREFIX || "!";
@@ -29,6 +31,36 @@ let READY = false;
 let BOOT_ERROR = null;
 
 app.get("/", (req, res) => res.status(200).send("ok"));
+
+// Handy helper page to start Kick OAuth (and avoids multi-line template literal syntax issues)
+app.get("/auth/kick", (req, res) => {
+  const baseUrl = getPublicBaseUrl(req);
+  const startUrl = `${baseUrl}/auth/kick/start`;
+
+  const html = [
+    "<!doctype html>",
+    "<html>",
+    "  <head>",
+    "    <meta charset=\"utf-8\" />",
+    "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />",
+    "    <title>Kick OAuth</title>",
+    "    <style>",
+    "      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:40px;}",
+    "      a{display:inline-block;padding:12px 16px;border:1px solid #ddd;border-radius:10px;text-decoration:none;}",
+    "      code{background:#f6f6f6;padding:2px 6px;border-radius:6px;}",
+    "    </style>",
+    "  </head>",
+    "  <body>",
+    "    <h1>Kick OAuth (Bot Account)</h1>",
+    "    <p>Click to authorize the bot to post chat messages.</p>",
+    `    <p><a href=\"${startUrl}\">Authorize on Kick</a></p>`,
+    "    <p>If you are testing locally, set <code>PUBLIC_BASE_URL</code> to your Railway URL.</p>",
+    "  </body>",
+    "</html>"
+  ].join("\n");
+
+  res.status(200).type("html").send(html);
+});
 
 app.get("/health", (req, res) => {
   if (READY) return res.status(200).json({ ok: true, ready: true, ts: Date.now() });
@@ -182,7 +214,7 @@ function getPublicBaseUrl(req) {
 }
 
 // ---------- OAuth endpoints for BOT account ----------
-app.get("/auth/kick/start", async (req, res) => {
+app.get("/auth/kick/start", (req, res) => {
   const clientId = process.env.KICK_CLIENT_ID;
   if (!clientId) return res.status(500).send("Missing KICK_CLIENT_ID");
 
@@ -193,10 +225,20 @@ app.get("/auth/kick/start", async (req, res) => {
   const codeVerifier = makeCodeVerifier();
   const codeChallenge = makeCodeChallenge(codeVerifier);
 
-  await setSetting("kick_oauth_state", state);
-  await setSetting("kick_oauth_code_verifier", codeVerifier);
+  // Store PKCE verifier + state in a signed, httpOnly cookie (works well on Railway)
+  res.cookie(
+    "kick_oauth",
+    { state, verifier: codeVerifier, ts: Date.now() },
+    {
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+      signed: true,
+      maxAge: 10 * 60 * 1000, // 10 minutes
+    }
+  );
 
-  const scope = "chat:write";
+  const scope = process.env.KICK_SCOPES || "user:read chat:write";
 
   const url =
     `https://id.kick.com/oauth/authorize` +
@@ -204,12 +246,11 @@ app.get("/auth/kick/start", async (req, res) => {
     `&client_id=${encodeURIComponent(clientId)}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
     `&scope=${encodeURIComponent(scope)}` +
+    `&state=${encodeURIComponent(state)}` +
     `&code_challenge=${encodeURIComponent(codeChallenge)}` +
-    `&code_challenge_method=S256` +
-    `&state=${encodeURIComponent(state)}`;
+    `&code_challenge_method=S256`;
 
-  console.log("Kick OAuth authorize URL:", url);
-  res.redirect(url);
+  return res.redirect(url);
 });
 
 app.get("/auth/kick/callback", async (req, res) => {
@@ -218,7 +259,8 @@ app.get("/auth/kick/callback", async (req, res) => {
     const state = String(req.query.state || "");
     if (!code) return res.status(400).send("Missing code");
 
-    const expectedState = await getSetting("kick_oauth_state");
+    const cookie = req.signedCookies?.kick_oauth;
+    const expectedState = cookie?.state;
     if (!expectedState || expectedState !== state) {
       return res.status(400).send("State mismatch. Retry /auth/kick/start");
     }
@@ -229,7 +271,7 @@ app.get("/auth/kick/callback", async (req, res) => {
       return res.status(500).send("Missing KICK_CLIENT_ID / KICK_CLIENT_SECRET");
     }
 
-    const code_verifier = await getSetting("kick_oauth_code_verifier");
+    const code_verifier = cookie?.verifier;
     if (!code_verifier) {
       return res.status(400).send("Missing PKCE verifier. Retry /auth/kick/start");
     }
@@ -267,13 +309,11 @@ app.get("/auth/kick/callback", async (req, res) => {
 
     if (!access || !refresh) return res.status(500).send("Missing tokens in response");
 
+    res.clearCookie("kick_oauth");
+
     await setSetting("kick_access_token", access);
     await setSetting("kick_refresh_token", refresh);
     await setSetting("kick_access_expires_at", String(expMs));
-
-    await setSetting("kick_oauth_state", "");
-    await setSetting("kick_oauth_code_verifier", "");
-
     res.send("✅ Bot account authorized! You can close this tab.");
   } catch (e) {
     console.error("OAuth callback error:", e);
@@ -370,8 +410,8 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
-  // !lb
-  if (lower === `${PREFIX}lb` || lower === `${PREFIX}leaderboard`) {
+  // !top (leaderboard)
+  if (lower === `${PREFIX}top` || lower === `${PREFIX}lb` || lower === `${PREFIX}leaderboard`) {
     const lb = await game.leaderboard(10);
     if (!lb.length) {
       try {
