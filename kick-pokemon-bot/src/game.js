@@ -3,7 +3,7 @@ const { envInt } = require("./util");
 const { pickTier } = require("./spawnTables");
 const { computePoints } = require("./points");
 
-// NEW: Gen 1 dex helpers (reads data/gen1.dex.json)
+// Gen 1 dex helpers (reads data/gen1.dex.json)
 const dex = require("./dex");
 
 function randInt(max) {
@@ -58,7 +58,7 @@ class Game {
   }
 
   /**
-   * NEW SPAWN:
+   * Spawn:
    * - picks a Gen 1 mon from data/gen1.dex.json
    * - rolls a level
    * - computes stats + moves
@@ -98,14 +98,14 @@ class Game {
 
     const spawn = await prisma.spawn.create({
       data: {
-        pokemon: p.name,       // keep string for chat guessing
-        pokemonId: p.id,       // stable id for battles
+        pokemon: p.name, // chat guesses this
+        pokemonId: p.id, // stable dex id for future PvP/trainer battles
         tier,
         isShiny,
         level,
         catchRate: p.catchRate || 45,
-        statsJson: stats,      // Json
-        movesJson: moves,      // Json
+        statsJson: stats,
+        movesJson: moves,
         spawnedAt,
         expiresAt
       }
@@ -121,9 +121,9 @@ class Game {
 
   /**
    * Catching:
-   * - still requires correct name
-   * - NEW: correct name triggers a catch roll based on (catchRate + level + tier)
-   * - higher level = lower catch chance
+   * - requires correct name
+   * - then rolls catch chance based on (catchRate + level + tier [+ shiny])
+   * - higher level = harder to catch
    * - higher level = more points
    */
   async tryCatch({ username, platformUserId, guessName }) {
@@ -137,17 +137,17 @@ class Game {
       return { ok: false, reason: "wrong_name" };
     }
 
-    // NEW: catch difficulty
+    // Level-based catch difficulty
     const chance = dex.catchChance({
       catchRate: spawn.catchRate || 45,
       level: spawn.level || 5,
       tier: spawn.tier || "common"
     });
 
-    // If shiny, make it slightly harder (optional)
+    // Optional: shiny slightly harder
     const finalChance = spawn.isShiny ? Math.max(0.01, chance * 0.85) : chance;
 
-    // roll
+    // Roll catch
     if (Math.random() > finalChance) {
       return { ok: false, reason: "catch_failed", chance: finalChance };
     }
@@ -157,14 +157,14 @@ class Game {
     const now = new Date();
     const speedMs = now.getTime() - new Date(spawn.spawnedAt).getTime();
 
-    // streak = consecutive catches without missing a spawn (simple version):
+    // streak: count catches within last 30 minutes (tune later)
     const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
     const recentCatches = await prisma.catch.count({
       where: { userId: user.id, caughtAt: { gt: thirtyMinAgo } }
     });
     const streak = Math.min(recentCatches, 10);
 
-    // base points (your existing logic)
+    // Base points (your existing logic)
     let pointsEarned = computePoints({
       tier: spawn.tier,
       isShiny: spawn.isShiny,
@@ -172,11 +172,10 @@ class Game {
       streak
     });
 
-    // NEW: level bonus points (tune however you like)
-    // Example: +0..+15ish depending on level
+    // Level bonus (tune however you want)
     pointsEarned += Math.floor((spawn.level || 5) / 5);
 
-    // Make sure only one person can catch: transactional update
+    // Transaction so only one person catches it
     const result = await prisma.$transaction(async (tx) => {
       const fresh = await tx.spawn.findUnique({ where: { id: spawn.id } });
       if (!fresh || fresh.caughtAt) return { ok: false, reason: "already_caught" };
@@ -193,11 +192,9 @@ class Game {
           pokemon: spawn.pokemon,
           tier: spawn.tier,
           isShiny: spawn.isShiny,
+          level: spawn.level, // ✅ saved for history/PvP selection later
           pointsEarned,
-          speedMs,
-
-          // OPTIONAL: store level for history (requires Catch model field)
-          // level: spawn.level
+          speedMs
         }
       });
 
