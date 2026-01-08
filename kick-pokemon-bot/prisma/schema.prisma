@@ -15,7 +15,7 @@ model User {
   identities  UserIdentity[]
   catches     Catch[]
 
-  // Spawns this user successfully caught
+  // ✅ Opposite side of Spawn.caughtByUser
   caughtSpawns Spawn[] @relation("CaughtSpawns")
 }
 
@@ -43,12 +43,8 @@ model Spawn {
   caughtAt  DateTime?
   caughtBy  String?
 
-  // User who caught this spawn (if any)
-  caughtByUser User? @relation(
-    "CaughtSpawns",
-    fields: [caughtBy],
-    references: [id]
-  )
+  // ✅ MUST have relation name that matches User.caughtSpawns
+  caughtByUser User? @relation("CaughtSpawns", fields: [caughtBy], references: [id])
 
   catches Catch[]
 }
