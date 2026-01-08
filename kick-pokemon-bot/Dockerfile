@@ -13,4 +13,8 @@ COPY src ./src
 ENV NODE_ENV=production
 EXPOSE 8080
 
+ COPY src ./src
++COPY data ./data
+
 CMD ["node", "src/server.js"]
+
