@@ -1,3 +1,4 @@
+// src/server.js
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -13,15 +14,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- Basic health / uptime routes ---
+app.get("/health", (req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
+app.get("/", (req, res) => res.status(200).send("ok"));
+
 const PORT = Number(process.env.PORT || 3000);
 const PREFIX = process.env.COMMAND_PREFIX || "!";
 const KICK_CHANNEL = process.env.KICK_CHANNEL;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 const STREAMER_USERNAME = (process.env.STREAMER_USERNAME || KICK_CHANNEL || "").toLowerCase();
-
-// --- Basic health routes (prevents Railway 502 confusion) ---
-app.get("/health", (req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
-app.get("/", (req, res) => res.status(200).send("ok"));
 
 if (!KICK_CHANNEL) {
   console.error("Missing KICK_CHANNEL in env.");
@@ -29,7 +30,7 @@ if (!KICK_CHANNEL) {
 
 const game = new Game();
 
-// ---------- DB bootstrap (Railway-only friendly) ----------
+// ---------- DB bootstrap (Railway friendly) ----------
 function ensureDbSchema() {
   try {
     console.log("Running: npx prisma db push");
@@ -71,7 +72,6 @@ async function spawnLoop() {
 
 // ---------- OAuth endpoints for BOT account ----------
 const crypto = global.crypto || require("crypto");
-
 function makeState() {
   return crypto.randomUUID();
 }
@@ -83,7 +83,7 @@ app.get("/auth/kick/start", async (req, res) => {
   const state = makeState();
   await setSetting("kick_oauth_state", state);
 
-  // Scopes needed for bot chat sending
+  // scopes needed for bot chat sending
   const scope = encodeURIComponent("chat:write");
   const redirectUri = encodeURIComponent(`${PUBLIC_BASE_URL}/auth/kick/callback`);
 
@@ -150,7 +150,7 @@ app.get("/auth/kick/callback", async (req, res) => {
     await setSetting("kick_refresh_token", refresh);
     await setSetting("kick_access_expires_at", String(expMs));
 
-    res.send("✅ Bot account authorized! Restart the Railway service to apply.");
+    res.send("✅ Bot account authorized! Restart the service (or wait a moment) and the bot can send chat.");
   } catch (e) {
     console.error("OAuth callback error:", e);
     res.status(500).send("OAuth callback failed (see server logs).");
@@ -225,7 +225,7 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
-  // !lb
+  // !lb / !leaderboard
   if (lower === `${PREFIX}lb` || lower === `${PREFIX}leaderboard`) {
     const lb = await game.leaderboard(10);
     if (!lb.length) {
@@ -275,7 +275,7 @@ async function handleChat({ username, userId, content }) {
 app.listen(PORT, async () => {
   console.log(`Server listening on ${PORT}`);
 
-  // DB must work; if it doesn't, exit so Railway restarts
+  // DB must work; if it doesn't, exit so the platform restarts the service
   try {
     ensureDbSchema();
     await prisma.$queryRaw`SELECT 1`;
@@ -284,7 +284,7 @@ app.listen(PORT, async () => {
     process.exit(1);
   }
 
-  // Start Kick reader (don’t crash the whole server if it fails)
+  // Kick reader (pure WS version from Option A; no Playwright)
   if (KICK_CHANNEL) {
     try {
       startKickReader({
@@ -298,11 +298,11 @@ app.listen(PORT, async () => {
     }
   }
 
-  // Start spawns, but don't crash the server if bot auth isn't ready
+  // Spawn loop (do not crash server if bot isn't authorized yet)
   try {
     await spawnLoop();
   } catch (e) {
     console.error("spawnLoop failed (likely missing Kick auth tokens):", e);
-    console.error("Authorize bot at /auth/kick/start then restart the Railway service.");
+    console.error("Authorize bot at /auth/kick/start then restart the service.");
   }
 });

@@ -1,8 +1,8 @@
-FROM mcr.microsoft.com/playwright:v1.47.0-jammy
+FROM node:18-bullseye-slim
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
+COPY package.json ./
 RUN npm install --omit=dev
 
 COPY prisma ./prisma
