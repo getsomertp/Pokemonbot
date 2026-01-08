@@ -6,8 +6,7 @@
   "scripts": {
     "dev": "node src/server.js",
     "start": "node src/server.js",
-    "migrate": "prisma migrate deploy",
-    "postinstall": "prisma generate"
+    "migrate": "prisma migrate deploy"
   },
   "dependencies": {
     "@prisma/client": "^5.18.0",
