@@ -21,24 +21,6 @@ class Game {
     this.levelMax = envInt("LEVEL_MAX", 75);
   }
 
-  async getActiveSeasonId() {
-    // Stored in DB so Railway restarts don’t lose it.
-    const row = await prisma.setting.findUnique({ where: { key: "season_id" } });
-    if (row?.value && Number.isFinite(Number(row.value))) return Number(row.value);
-
-    await prisma.setting.upsert({
-      where: { key: "season_id" },
-      update: { value: "1" },
-      create: { key: "season_id", value: "1" }
-    });
-    await prisma.setting.upsert({
-      where: { key: "season_started_at" },
-      update: { value: new Date().toISOString() },
-      create: { key: "season_started_at", value: new Date().toISOString() }
-    });
-    return 1;
-  }
-
   async getOrCreateKickUser(username, platformUserId = null) {
     const handle = String(username || "").toLowerCase();
     const existing = await prisma.userIdentity.findUnique({
@@ -148,16 +130,11 @@ class Game {
     const spawn = await this.getActiveSpawn();
     if (!spawn) return { ok: false, reason: "no_spawn" };
 
-    // If guessName is omitted, treat it as "catch the active spawn".
-    // This enables a simple chat command: "catch" (only one spawn at a time).
-    const guess = String(guessName || "")
-      .trim()
-      .toLowerCase();
+    const guess = String(guessName || "").trim().toLowerCase();
+    if (!guess) return { ok: false, reason: "no_guess" };
 
-    if (guess) {
-      if (guess !== String(spawn.pokemon || "").toLowerCase()) {
-        return { ok: false, reason: "wrong_name" };
-      }
+    if (guess !== String(spawn.pokemon || "").toLowerCase()) {
+      return { ok: false, reason: "wrong_name" };
     }
 
     // Level-based catch difficulty
@@ -198,8 +175,6 @@ class Game {
     // Level bonus (tune however you want)
     pointsEarned += Math.floor((spawn.level || 5) / 5);
 
-    const season = await this.getActiveSeasonId();
-
     // Transaction so only one person catches it
     const result = await prisma.$transaction(async (tx) => {
       const fresh = await tx.spawn.findUnique({ where: { id: spawn.id } });
@@ -218,7 +193,6 @@ class Game {
           tier: spawn.tier,
           isShiny: spawn.isShiny,
           level: spawn.level, // ✅ saved for history/PvP selection later
-          season,
           pointsEarned,
           speedMs
         }
@@ -231,10 +205,8 @@ class Game {
   }
 
   async leaderboard(limit = 10) {
-    const season = await this.getActiveSeasonId();
     const rows = await prisma.catch.groupBy({
       by: ["userId"],
-      where: { season },
       _sum: { pointsEarned: true },
       orderBy: { _sum: { pointsEarned: "desc" } },
       take: limit
@@ -262,9 +234,7 @@ class Game {
     });
     if (!ident?.user) return null;
 
-    const season = await this.getActiveSeasonId();
-    const [seasonPoints, totalPoints, totalCatches, totalShinies] = await Promise.all([
-      prisma.catch.aggregate({ where: { userId: ident.user.id, season }, _sum: { pointsEarned: true } }),
+    const [totalPoints, totalCatches, totalShinies] = await Promise.all([
       prisma.catch.aggregate({ where: { userId: ident.user.id }, _sum: { pointsEarned: true } }),
       prisma.catch.count({ where: { userId: ident.user.id } }),
       prisma.catch.count({ where: { userId: ident.user.id, isShiny: true } })
@@ -272,8 +242,6 @@ class Game {
 
     return {
       name: ident.user.displayName || username,
-      season,
-      seasonPoints: seasonPoints._sum.pointsEarned || 0,
       points: totalPoints._sum.pointsEarned || 0,
       catches: totalCatches,
       shinies: totalShinies
