@@ -11,19 +11,23 @@ model User {
   id          String         @id @default(uuid())
   createdAt   DateTime       @default(now())
   displayName String?
+
   identities  UserIdentity[]
   catches     Catch[]
+
+  // Spawns this user successfully caught
+  caughtSpawns Spawn[] @relation("CaughtSpawns")
 }
 
 model UserIdentity {
   id             String   @id @default(uuid())
   userId         String
   platform       String   // "kick" now, "discord" later
-  platformUserId String?  // kick user id if you store it later
-  handle         String   // username
+  platformUserId String?
+  handle         String
   createdAt      DateTime @default(now())
 
-  user User @relation(fields: [userId], references: [id])
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([platform, handle])
 }
@@ -31,13 +35,20 @@ model UserIdentity {
 model Spawn {
   id        String   @id @default(uuid())
   pokemon   String
-  tier      String   // common/uncommon/rare/epic/legendary
+  tier      String   // common | uncommon | rare | epic | legendary
   isShiny   Boolean  @default(false)
   spawnedAt DateTime @default(now())
   expiresAt DateTime
+
   caughtAt  DateTime?
   caughtBy  String?
-  caughtByUser User? @relation(fields: [caughtBy], references: [id])
+
+  // User who caught this spawn (if any)
+  caughtByUser User? @relation(
+    "CaughtSpawns",
+    fields: [caughtBy],
+    references: [id]
+  )
 
   catches Catch[]
 }
@@ -50,18 +61,18 @@ model Catch {
   tier         String
   isShiny      Boolean  @default(false)
   pointsEarned Int
-  caughtAt     DateTime @default(now())
   speedMs      Int
+  caughtAt     DateTime @default(now())
 
-  user  User  @relation(fields: [userId], references: [id])
-  spawn Spawn @relation(fields: [spawnId], references: [id])
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  spawn Spawn @relation(fields: [spawnId], references: [id], onDelete: Cascade)
 
   @@index([caughtAt])
   @@index([userId, caughtAt])
 }
 
 model Setting {
-  key   String @id
-  value String
+  key       String   @id
+  value     String
   updatedAt DateTime @updatedAt
 }
