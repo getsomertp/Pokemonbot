@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { execSync } = require("child_process");
+const crypto = require("crypto");
 
 const { prisma } = require("./prisma");
 const { Game } = require("./game");
@@ -11,20 +12,23 @@ const { startKickReader } = require("./kickRead");
 const { sendKickChatMessage, setSetting, getSetting } = require("./kickSend");
 
 const app = express();
+app.set("trust proxy", 1); // IMPORTANT for Railway (correct https in req.protocol)
+
 app.use(cors());
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
 const PREFIX = process.env.COMMAND_PREFIX || "!";
 const KICK_CHANNEL = process.env.KICK_CHANNEL;
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 const STREAMER_USERNAME = (process.env.STREAMER_USERNAME || KICK_CHANNEL || "").toLowerCase();
 
 const game = new Game();
 
-// ---- Readiness / health (prevents Railway 502 confusion) ----
+// ---- Readiness / health (helps avoid Railway 502 confusion) ----
 let READY = false;
 let BOOT_ERROR = null;
+
+app.get("/", (req, res) => res.status(200).send("ok"));
 
 app.get("/health", (req, res) => {
   if (READY) return res.status(200).json({ ok: true, ready: true, ts: Date.now() });
@@ -36,17 +40,13 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/", (req, res) => res.status(200).send("ok"));
-
-process.on("unhandledRejection", (e) => {
-  console.error("UNHANDLED REJECTION:", e);
-});
-process.on("uncaughtException", (e) => {
-  console.error("UNCAUGHT EXCEPTION:", e);
-});
+process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
 
 // ---------- DB bootstrap ----------
 function ensureDbSchema() {
+  // If you prefer NOT to run this at boot, remove this function call below and run
+  // `npx prisma db push` manually in Railway instead.
   console.log("Running: npx prisma db push");
   execSync("npx prisma db push", { stdio: "inherit" });
   console.log("✅ prisma db push complete");
@@ -149,30 +149,65 @@ async function spawnLoop() {
   }, interval);
 }
 
-// ---------- OAuth endpoints for BOT account ----------
-const crypto = global.crypto || require("crypto");
+// ---------- PKCE helpers (REQUIRED by Kick OAuth 2.1) ----------
+function base64UrlEncode(buf) {
+  return Buffer.from(buf)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function makeCodeVerifier() {
+  // 43-128 chars recommended; we’ll use 64 bytes -> base64url ~86 chars
+  return base64UrlEncode(crypto.randomBytes(64));
+}
+
+function makeCodeChallenge(verifier) {
+  const hash = crypto.createHash("sha256").update(verifier).digest();
+  return base64UrlEncode(hash);
+}
+
 function makeState() {
   return crypto.randomUUID();
 }
 
+function getPublicBaseUrl(req) {
+  // Prefer explicit env var, else infer from request (works on Railway with trust proxy)
+  const fromEnv = process.env.PUBLIC_BASE_URL;
+  if (fromEnv) return fromEnv.replace(/\/+$/g, "");
+  return `${req.protocol}://${req.get("host")}`.replace(/\/+$/g, "");
+}
+
+// ---------- OAuth endpoints for BOT account ----------
 app.get("/auth/kick/start", async (req, res) => {
   const clientId = process.env.KICK_CLIENT_ID;
   if (!clientId) return res.status(500).send("Missing KICK_CLIENT_ID");
 
-  const state = makeState();
-  await setSetting("kick_oauth_state", state);
+  const baseUrl = getPublicBaseUrl(req);
+  const redirectUri = `${baseUrl}/auth/kick/callback`;
 
-  const scope = encodeURIComponent("chat:write");
-  const redirectUri = encodeURIComponent(`${PUBLIC_BASE_URL}/auth/kick/callback`);
+  // Kick OAuth requires state + PKCE (code_challenge / code_verifier). :contentReference[oaicite:1]{index=1}
+  const state = makeState();
+  const codeVerifier = makeCodeVerifier();
+  const codeChallenge = makeCodeChallenge(codeVerifier);
+
+  await setSetting("kick_oauth_state", state);
+  await setSetting("kick_oauth_code_verifier", codeVerifier);
+
+  const scope = "chat:write"; // adjust later if you add more scopes
 
   const url =
     `https://id.kick.com/oauth/authorize` +
     `?response_type=code` +
     `&client_id=${encodeURIComponent(clientId)}` +
-    `&redirect_uri=${redirectUri}` +
-    `&scope=${scope}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&scope=${encodeURIComponent(scope)}` +
+    `&code_challenge=${encodeURIComponent(codeChallenge)}` +
+    `&code_challenge_method=S256` +
     `&state=${encodeURIComponent(state)}`;
 
+  console.log("Kick OAuth authorize URL:", url);
   res.redirect(url);
 });
 
@@ -193,14 +228,21 @@ app.get("/auth/kick/callback", async (req, res) => {
       return res.status(500).send("Missing KICK_CLIENT_ID / KICK_CLIENT_SECRET");
     }
 
-    const tokenUrl = "https://id.kick.com/oauth/token";
-    const redirect_uri = `${PUBLIC_BASE_URL}/auth/kick/callback`;
+    const code_verifier = await getSetting("kick_oauth_code_verifier");
+    if (!code_verifier) {
+      return res.status(400).send("Missing PKCE verifier. Retry /auth/kick/start");
+    }
 
+    const baseUrl = getPublicBaseUrl(req);
+    const redirect_uri = `${baseUrl}/auth/kick/callback`;
+
+    const tokenUrl = "https://id.kick.com/oauth/token";
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       client_id,
       client_secret,
       redirect_uri,
+      code_verifier,
       code
     });
 
@@ -228,7 +270,9 @@ app.get("/auth/kick/callback", async (req, res) => {
     await setSetting("kick_refresh_token", refresh);
     await setSetting("kick_access_expires_at", String(expMs));
 
-    await refreshKickTokenIfNeeded({ force: false });
+    // Clear one-time values
+    await setSetting("kick_oauth_state", "");
+    await setSetting("kick_oauth_code_verifier", "");
 
     res.send("✅ Bot account authorized! You can close this tab.");
   } catch (e) {
@@ -272,6 +316,7 @@ async function handleChat({ username, userId, content }) {
 
   const lower = msg.toLowerCase();
 
+  // !catch <name>
   if (lower.startsWith(`${PREFIX}catch `)) {
     const guess = msg.slice(`${PREFIX}catch `.length);
     const result = await game.tryCatch({
@@ -287,7 +332,6 @@ async function handleChat({ username, userId, content }) {
           await refreshKickTokenIfNeeded();
           await sendKickChatMessage("No Pokémon active right now.");
         } catch {}
-        return;
       }
       return;
     }
@@ -305,6 +349,7 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
+  // !lb
   if (lower === `${PREFIX}lb` || lower === `${PREFIX}leaderboard`) {
     const lb = await game.leaderboard(10);
     if (!lb.length) {
@@ -324,6 +369,7 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
+  // !me
   if (lower === `${PREFIX}me`) {
     const stats = await game.userStats(username);
     if (!stats) {
@@ -344,6 +390,7 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
+  // !spawn (streamer-only)
   if (lower === `${PREFIX}spawn`) {
     if (String(username || "").toLowerCase() !== STREAMER_USERNAME) return;
     const s = await game.spawn();
@@ -356,26 +403,33 @@ async function handleChat({ username, userId, content }) {
 app.listen(PORT, () => {
   console.log(`Server listening on ${PORT}`);
 
-  // Start loops AFTER server is listening (prevents 502)
+  // Start loops AFTER server is listening (prevents Railway 502 while booting)
   (async () => {
     try {
       ensureDbSchema();
       await prisma.$queryRaw`SELECT 1`;
+
       startTokenRefreshLoop();
 
       if (KICK_CHANNEL) {
-        startKickReader({
-          channel: KICK_CHANNEL,
-          onChat: handleChat,
-          onStatus: (s) => console.log(s),
-          onError: (e) => console.error(e)
-        });
+        try {
+          startKickReader({
+            channel: KICK_CHANNEL,
+            onChat: handleChat,
+            onStatus: (s) => console.log(s),
+            onError: (e) => console.error(e)
+          });
+        } catch (e) {
+          console.error("Kick reader failed to start:", e);
+        }
+      } else {
+        console.log("KICK_CHANNEL not set (chat reader disabled).");
       }
 
       try {
         await spawnLoop();
       } catch (e) {
-        console.error("spawnLoop failed (likely missing Kick auth tokens):", e);
+        console.error("spawnLoop failed:", e);
       }
 
       READY = true;
