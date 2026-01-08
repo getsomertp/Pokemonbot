@@ -19,6 +19,10 @@ const KICK_CHANNEL = process.env.KICK_CHANNEL;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 const STREAMER_USERNAME = (process.env.STREAMER_USERNAME || KICK_CHANNEL || "").toLowerCase();
 
+// --- Basic health routes (prevents Railway 502 confusion) ---
+app.get("/health", (req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
+app.get("/", (req, res) => res.status(200).send("ok"));
+
 if (!KICK_CHANNEL) {
   console.error("Missing KICK_CHANNEL in env.");
 }
@@ -42,8 +46,12 @@ async function announceSpawn(spawn) {
   const shinyTag = spawn.isShiny ? " ✨SHINY✨" : "";
   const msg = `A wild ${spawn.pokemon} appeared (${spawn.tier})${shinyTag}! Type ${PREFIX}catch ${spawn.pokemon}`;
 
-  const res = await sendKickChatMessage(msg);
-  if (!res.ok) console.log("send message failed:", res);
+  try {
+    const res = await sendKickChatMessage(msg);
+    if (!res?.ok) console.log("send message failed:", res);
+  } catch (e) {
+    console.error("announceSpawn failed (likely bot not authorized yet):", e?.message || e);
+  }
 }
 
 async function spawnLoop() {
@@ -62,12 +70,11 @@ async function spawnLoop() {
 }
 
 // ---------- OAuth endpoints for BOT account ----------
+const crypto = global.crypto || require("crypto");
+
 function makeState() {
   return crypto.randomUUID();
 }
-
-// Node 18 has global crypto, but some environments need explicit:
-const crypto = global.crypto || require("crypto");
 
 app.get("/auth/kick/start", async (req, res) => {
   const clientId = process.env.KICK_CLIENT_ID;
@@ -92,57 +99,62 @@ app.get("/auth/kick/start", async (req, res) => {
 });
 
 app.get("/auth/kick/callback", async (req, res) => {
-  const code = String(req.query.code || "");
-  const state = String(req.query.state || "");
-  if (!code) return res.status(400).send("Missing code");
+  try {
+    const code = String(req.query.code || "");
+    const state = String(req.query.state || "");
+    if (!code) return res.status(400).send("Missing code");
 
-  const expectedState = await getSetting("kick_oauth_state");
-  if (!expectedState || expectedState !== state) {
-    return res.status(400).send("State mismatch. Retry /auth/kick/start");
+    const expectedState = await getSetting("kick_oauth_state");
+    if (!expectedState || expectedState !== state) {
+      return res.status(400).send("State mismatch. Retry /auth/kick/start");
+    }
+
+    const client_id = process.env.KICK_CLIENT_ID;
+    const client_secret = process.env.KICK_CLIENT_SECRET;
+    if (!client_id || !client_secret) {
+      return res.status(500).send("Missing KICK_CLIENT_ID / KICK_CLIENT_SECRET");
+    }
+
+    const tokenUrl = "https://id.kick.com/oauth/token";
+    const redirect_uri = `${PUBLIC_BASE_URL}/auth/kick/callback`;
+
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id,
+      client_secret,
+      redirect_uri,
+      code
+    });
+
+    const resp = await fetch(tokenUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      return res.status(500).send(`Token exchange failed: ${resp.status}\n${text}`);
+    }
+
+    const data = await resp.json();
+
+    const access = data.access_token;
+    const refresh = data.refresh_token;
+    const expiresIn = Number(data.expires_in || 3600);
+    const expMs = Date.now() + expiresIn * 1000;
+
+    if (!access || !refresh) return res.status(500).send("Missing tokens in response");
+
+    await setSetting("kick_access_token", access);
+    await setSetting("kick_refresh_token", refresh);
+    await setSetting("kick_access_expires_at", String(expMs));
+
+    res.send("✅ Bot account authorized! Restart the Railway service to apply.");
+  } catch (e) {
+    console.error("OAuth callback error:", e);
+    res.status(500).send("OAuth callback failed (see server logs).");
   }
-
-  const client_id = process.env.KICK_CLIENT_ID;
-  const client_secret = process.env.KICK_CLIENT_SECRET;
-  if (!client_id || !client_secret) {
-    return res.status(500).send("Missing KICK_CLIENT_ID / KICK_CLIENT_SECRET");
-  }
-
-  const tokenUrl = "https://id.kick.com/oauth/token";
-  const redirect_uri = `${PUBLIC_BASE_URL}/auth/kick/callback`;
-
-  const body = new URLSearchParams({
-    grant_type: "authorization_code",
-    client_id,
-    client_secret,
-    redirect_uri,
-    code
-  });
-
-  const resp = await fetch(tokenUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body
-  });
-
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    return res.status(500).send(`Token exchange failed: ${resp.status}\n${text}`);
-  }
-
-  const data = await resp.json();
-
-  const access = data.access_token;
-  const refresh = data.refresh_token;
-  const expiresIn = Number(data.expires_in || 3600);
-  const expMs = Date.now() + expiresIn * 1000;
-
-  if (!access || !refresh) return res.status(500).send("Missing tokens in response");
-
-  await setSetting("kick_access_token", access);
-  await setSetting("kick_refresh_token", refresh);
-  await setSetting("kick_access_expires_at", String(expMs));
-
-  res.send("✅ Bot account authorized! You can close this tab and restart the Railway service.");
 });
 
 // ---------- API endpoints ----------
@@ -192,7 +204,9 @@ async function handleChat({ username, userId, content }) {
     if (!result.ok) {
       if (result.reason === "wrong_name") return; // silent miss
       if (result.reason === "no_spawn") {
-        await sendKickChatMessage(`No Pokémon active right now.`);
+        try {
+          await sendKickChatMessage(`No Pokémon active right now.`);
+        } catch {}
         return;
       }
       if (result.reason === "already_caught") return;
@@ -201,9 +215,13 @@ async function handleChat({ username, userId, content }) {
 
     const s = result.spawn;
     const shinyTag = s.isShiny ? " ✨SHINY✨" : "";
-    await sendKickChatMessage(
-      `${username} caught ${s.pokemon}${shinyTag} for ${result.catch.pointsEarned} pts!`
-    );
+    try {
+      await sendKickChatMessage(
+        `${username} caught ${s.pokemon}${shinyTag} for ${result.catch.pointsEarned} pts!`
+      );
+    } catch (e) {
+      console.error("sendKickChatMessage failed:", e?.message || e);
+    }
     return;
   }
 
@@ -211,11 +229,17 @@ async function handleChat({ username, userId, content }) {
   if (lower === `${PREFIX}lb` || lower === `${PREFIX}leaderboard`) {
     const lb = await game.leaderboard(10);
     if (!lb.length) {
-      await sendKickChatMessage("No points yet.");
+      try {
+        await sendKickChatMessage("No points yet.");
+      } catch {}
       return;
     }
     const line = lb.map((r) => `${r.rank}. ${r.name}: ${r.points}`).join(" | ");
-    await sendKickChatMessage(`🏆 Points Leaderboard — ${line}`);
+    try {
+      await sendKickChatMessage(`🏆 Points Leaderboard — ${line}`);
+    } catch (e) {
+      console.error("sendKickChatMessage failed:", e?.message || e);
+    }
     return;
   }
 
@@ -223,12 +247,18 @@ async function handleChat({ username, userId, content }) {
   if (lower === `${PREFIX}me`) {
     const stats = await game.userStats(username);
     if (!stats) {
-      await sendKickChatMessage(`${username}: no stats yet. Catch something!`);
+      try {
+        await sendKickChatMessage(`${username}: no stats yet. Catch something!`);
+      } catch {}
       return;
     }
-    await sendKickChatMessage(
-      `${stats.name} — ${stats.points} pts | ${stats.catches} catches | ✨${stats.shinies}`
-    );
+    try {
+      await sendKickChatMessage(
+        `${stats.name} — ${stats.points} pts | ${stats.catches} catches | ✨${stats.shinies}`
+      );
+    } catch (e) {
+      console.error("sendKickChatMessage failed:", e?.message || e);
+    }
     return;
   }
 
@@ -245,11 +275,14 @@ async function handleChat({ username, userId, content }) {
 app.listen(PORT, async () => {
   console.log(`Server listening on ${PORT}`);
 
-  // Create tables if missing
-  ensureDbSchema();
-
-  // Sanity check DB connection
-  await prisma.$queryRaw`SELECT 1`;
+  // DB must work; if it doesn't, exit so Railway restarts
+  try {
+    ensureDbSchema();
+    await prisma.$queryRaw`SELECT 1`;
+  } catch (e) {
+    console.error("DB bootstrap failed:", e);
+    process.exit(1);
+  }
 
   // Start Kick reader (don’t crash the whole server if it fails)
   if (KICK_CHANNEL) {
@@ -265,6 +298,11 @@ app.listen(PORT, async () => {
     }
   }
 
-  // Start spawns
-  await spawnLoop();
+  // Start spawns, but don't crash the server if bot auth isn't ready
+  try {
+    await spawnLoop();
+  } catch (e) {
+    console.error("spawnLoop failed (likely missing Kick auth tokens):", e);
+    console.error("Authorize bot at /auth/kick/start then restart the Railway service.");
+  }
 });
