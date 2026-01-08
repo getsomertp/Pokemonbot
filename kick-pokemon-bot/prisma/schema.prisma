@@ -8,14 +8,14 @@ datasource db {
 }
 
 model User {
-  id          String         @id @default(uuid())
-  createdAt   DateTime       @default(now())
+  id          String   @id @default(uuid())
+  createdAt   DateTime @default(now())
   displayName String?
 
-  identities  UserIdentity[]
-  catches     Catch[]
+  identities   UserIdentity[]
+  catches      Catch[]
 
-  // ✅ Opposite side of Spawn.caughtByUser
+  // Opposite side of Spawn.caughtByUser
   caughtSpawns Spawn[] @relation("CaughtSpawns")
 }
 
@@ -34,16 +34,33 @@ model UserIdentity {
 
 model Spawn {
   id        String   @id @default(uuid())
+
+  // What chat guesses (keep this)
   pokemon   String
+
+  // NEW: stable dex id (e.g. "pikachu") for battles/logic
+  pokemonId String?
+
   tier      String   // common | uncommon | rare | epic | legendary
   isShiny   Boolean  @default(false)
+
+  // NEW: random level spawns
+  level     Int      @default(5)
+
+  // NEW: base catch rate (from species)
+  catchRate Int      @default(45)
+
+  // NEW: precomputed stats + moves for this spawn (so battles don’t need recompute)
+  statsJson Json?
+  movesJson Json?
+
   spawnedAt DateTime @default(now())
   expiresAt DateTime
 
   caughtAt  DateTime?
   caughtBy  String?
 
-  // ✅ MUST have relation name that matches User.caughtSpawns
+  // MUST have relation name that matches User.caughtSpawns
   caughtByUser User? @relation("CaughtSpawns", fields: [caughtBy], references: [id])
 
   catches Catch[]
@@ -53,9 +70,14 @@ model Catch {
   id           String   @id @default(uuid())
   userId       String
   spawnId      String
+
   pokemon      String
   tier         String
   isShiny      Boolean  @default(false)
+
+  // NEW (optional but recommended): store the level that was caught
+  level        Int?     
+
   pointsEarned Int
   speedMs      Int
   caughtAt     DateTime @default(now())
