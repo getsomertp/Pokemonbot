@@ -1,0 +1,25 @@
+{
+  "name": "kick-pokemon-bot",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "node src/server.js",
+    "migrate": "prisma migrate deploy",
+    "postinstall": "prisma generate"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.18.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "kick-live-connector": "^1.0.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
