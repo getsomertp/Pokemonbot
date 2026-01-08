@@ -45,8 +45,6 @@ process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
 
 // ---------- DB bootstrap ----------
 function ensureDbSchema() {
-  // If you prefer NOT to run this at boot, remove this function call below and run
-  // `npx prisma db push` manually in Railway instead.
   console.log("Running: npx prisma db push");
   execSync("npx prisma db push", { stdio: "inherit" });
   console.log("✅ prisma db push complete");
@@ -121,9 +119,15 @@ function startTokenRefreshLoop() {
 }
 
 // ---------- Spawns ----------
+function spawnLabel(spawn) {
+  const levelTag = spawn?.level ? `Lv. ${spawn.level} ` : "";
+  const shinyTag = spawn?.isShiny ? " ✨SHINY✨" : "";
+  const tierTag = spawn?.tier ? ` (${spawn.tier})` : "";
+  return `${levelTag}${spawn.pokemon}${tierTag}${shinyTag}`;
+}
+
 async function announceSpawn(spawn) {
-  const shinyTag = spawn.isShiny ? " ✨SHINY✨" : "";
-  const msg = `A wild ${spawn.pokemon} appeared (${spawn.tier})${shinyTag}! Type ${PREFIX}catch ${spawn.pokemon}`;
+  const msg = `A wild ${spawnLabel(spawn)} appeared! Type ${PREFIX}catch ${spawn.pokemon}`;
 
   try {
     await refreshKickTokenIfNeeded();
@@ -159,7 +163,6 @@ function base64UrlEncode(buf) {
 }
 
 function makeCodeVerifier() {
-  // 43-128 chars recommended; we’ll use 64 bytes -> base64url ~86 chars
   return base64UrlEncode(crypto.randomBytes(64));
 }
 
@@ -173,7 +176,6 @@ function makeState() {
 }
 
 function getPublicBaseUrl(req) {
-  // Prefer explicit env var, else infer from request (works on Railway with trust proxy)
   const fromEnv = process.env.PUBLIC_BASE_URL;
   if (fromEnv) return fromEnv.replace(/\/+$/g, "");
   return `${req.protocol}://${req.get("host")}`.replace(/\/+$/g, "");
@@ -187,7 +189,6 @@ app.get("/auth/kick/start", async (req, res) => {
   const baseUrl = getPublicBaseUrl(req);
   const redirectUri = `${baseUrl}/auth/kick/callback`;
 
-  // Kick OAuth requires state + PKCE (code_challenge / code_verifier). :contentReference[oaicite:1]{index=1}
   const state = makeState();
   const codeVerifier = makeCodeVerifier();
   const codeChallenge = makeCodeChallenge(codeVerifier);
@@ -195,7 +196,7 @@ app.get("/auth/kick/start", async (req, res) => {
   await setSetting("kick_oauth_state", state);
   await setSetting("kick_oauth_code_verifier", codeVerifier);
 
-  const scope = "chat:write"; // adjust later if you add more scopes
+  const scope = "chat:write";
 
   const url =
     `https://id.kick.com/oauth/authorize` +
@@ -270,7 +271,6 @@ app.get("/auth/kick/callback", async (req, res) => {
     await setSetting("kick_refresh_token", refresh);
     await setSetting("kick_access_expires_at", String(expMs));
 
-    // Clear one-time values
     await setSetting("kick_oauth_state", "");
     await setSetting("kick_oauth_code_verifier", "");
 
@@ -327,21 +327,42 @@ async function handleChat({ username, userId, content }) {
 
     if (!result.ok) {
       if (result.reason === "wrong_name") return;
+
       if (result.reason === "no_spawn") {
         try {
           await refreshKickTokenIfNeeded();
           await sendKickChatMessage("No Pokémon active right now.");
         } catch {}
+        return;
       }
+
+      if (result.reason === "already_caught") return;
+
+      // NEW: catch failed (correct name but it broke free)
+      if (result.reason === "catch_failed") {
+        const pct = typeof result.chance === "number" ? Math.round(result.chance * 100) : null;
+        try {
+          await refreshKickTokenIfNeeded();
+          await sendKickChatMessage(
+            pct
+              ? `${username} almost had it… it broke free! (${pct}% catch chance)`
+              : `${username} almost had it… it broke free!`
+          );
+        } catch {}
+        return;
+      }
+
       return;
     }
 
     const s = result.spawn;
     const shinyTag = s.isShiny ? " ✨SHINY✨" : "";
+    const lvlTag = s.level ? `Lv. ${s.level} ` : "";
+
     try {
       await refreshKickTokenIfNeeded();
       await sendKickChatMessage(
-        `${username} caught ${s.pokemon}${shinyTag} for ${result.catch.pointsEarned} pts!`
+        `${username} caught ${lvlTag}${s.pokemon}${shinyTag} for ${result.catch.pointsEarned} pts!`
       );
     } catch (e) {
       console.error("sendKickChatMessage failed:", e?.message || e);
@@ -403,7 +424,6 @@ async function handleChat({ username, userId, content }) {
 app.listen(PORT, () => {
   console.log(`Server listening on ${PORT}`);
 
-  // Start loops AFTER server is listening (prevents Railway 502 while booting)
   (async () => {
     try {
       ensureDbSchema();
