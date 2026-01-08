@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const { execSync } = require("child_process");
 
 const { prisma } = require("./prisma");
 const { Game } = require("./game");
@@ -24,9 +25,23 @@ if (!KICK_CHANNEL) {
 
 const game = new Game();
 
+// ---------- DB bootstrap (Railway-only friendly) ----------
+function ensureDbSchema() {
+  try {
+    console.log("Running: npx prisma db push");
+    execSync("npx prisma db push", { stdio: "inherit" });
+    console.log("✅ prisma db push complete");
+  } catch (e) {
+    console.error("❌ prisma db push failed (check DATABASE_URL / Postgres plugin)");
+    throw e;
+  }
+}
+
+// ---------- Spawns ----------
 async function announceSpawn(spawn) {
   const shinyTag = spawn.isShiny ? " ✨SHINY✨" : "";
   const msg = `A wild ${spawn.pokemon} appeared (${spawn.tier})${shinyTag}! Type ${PREFIX}catch ${spawn.pokemon}`;
+
   const res = await sendKickChatMessage(msg);
   if (!res.ok) console.log("send message failed:", res);
 }
@@ -37,23 +52,21 @@ async function spawnLoop() {
 
   const interval = envInt("SPAWN_INTERVAL_SECONDS", 90) * 1000;
   setInterval(async () => {
-    const s = await game.spawn();
-    await announceSpawn(s);
+    try {
+      const s = await game.spawn();
+      await announceSpawn(s);
+    } catch (e) {
+      console.error("Spawn loop error:", e);
+    }
   }, interval);
 }
 
-/**
- * OAuth endpoints for the BOT account:
- * - Visit /auth/kick/start while logged in as the bot account in your browser
- * - Approve scopes, then callback stores refresh token in DB
- *
- * Official token URL and chat endpoint are documented by Kick Dev. :contentReference[oaicite:6]{index=6}
- */
+// ---------- OAuth endpoints for BOT account ----------
 function makeState() {
   return crypto.randomUUID();
 }
 
-// Node 18 has global crypto, but Railway sometimes needs explicit:
+// Node 18 has global crypto, but some environments need explicit:
 const crypto = global.crypto || require("crypto");
 
 app.get("/auth/kick/start", async (req, res) => {
@@ -94,7 +107,7 @@ app.get("/auth/kick/callback", async (req, res) => {
     return res.status(500).send("Missing KICK_CLIENT_ID / KICK_CLIENT_SECRET");
   }
 
-  const tokenUrl = "https://id.kick.com/oauth/token"; // :contentReference[oaicite:7]{index=7}
+  const tokenUrl = "https://id.kick.com/oauth/token";
   const redirect_uri = `${PUBLIC_BASE_URL}/auth/kick/callback`;
 
   const body = new URLSearchParams({
@@ -118,7 +131,6 @@ app.get("/auth/kick/callback", async (req, res) => {
 
   const data = await resp.json();
 
-  // Persist tokens
   const access = data.access_token;
   const refresh = data.refresh_token;
   const expiresIn = Number(data.expires_in || 3600);
@@ -133,25 +145,35 @@ app.get("/auth/kick/callback", async (req, res) => {
   res.send("✅ Bot account authorized! You can close this tab and restart the Railway service.");
 });
 
-// Overlay / debug
+// ---------- API endpoints ----------
 app.get("/state", async (req, res) => {
-  const spawn = await game.getActiveSpawn();
-  const lb = await game.leaderboard(10);
-  res.json({ spawn, leaderboard: lb });
+  try {
+    const spawn = await game.getActiveSpawn();
+    const lb = await game.leaderboard(10);
+    res.json({ spawn, leaderboard: lb });
+  } catch (e) {
+    console.error("/state error:", e);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
 });
 
-// Manual spawn (admin)
 app.post("/admin/spawn", async (req, res) => {
   const key = req.headers["x-admin-key"];
   if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) {
     return res.status(401).json({ ok: false, error: "unauthorized" });
   }
-  const s = await game.spawn();
-  await announceSpawn(s);
-  res.json({ ok: true, spawn: s });
+
+  try {
+    const s = await game.spawn();
+    await announceSpawn(s);
+    res.json({ ok: true, spawn: s });
+  } catch (e) {
+    console.error("/admin/spawn error:", e);
+    res.status(500).json({ ok: false, error: "internal_error" });
+  }
 });
 
-// Kick chat command handler
+// ---------- Kick chat command handler ----------
 async function handleChat({ username, userId, content }) {
   const msg = String(content || "").trim();
   if (!msg.startsWith(PREFIX)) return;
@@ -192,7 +214,7 @@ async function handleChat({ username, userId, content }) {
       await sendKickChatMessage("No points yet.");
       return;
     }
-    const line = lb.map(r => `${r.rank}. ${r.name}: ${r.points}`).join(" | ");
+    const line = lb.map((r) => `${r.rank}. ${r.name}: ${r.points}`).join(" | ");
     await sendKickChatMessage(`🏆 Points Leaderboard — ${line}`);
     return;
   }
@@ -219,23 +241,30 @@ async function handleChat({ username, userId, content }) {
   }
 }
 
-// Start everything
+// ---------- Start everything ----------
 app.listen(PORT, async () => {
   console.log(`Server listening on ${PORT}`);
 
-  // Ensure DB connection early
+  // Create tables if missing
+  ensureDbSchema();
+
+  // Sanity check DB connection
   await prisma.$queryRaw`SELECT 1`;
 
-  // Kick reader (reads chat)
+  // Start Kick reader (don’t crash the whole server if it fails)
   if (KICK_CHANNEL) {
-    startKickReader({
-      channel: KICK_CHANNEL,
-      onChat: handleChat,
-      onStatus: (s) => console.log(s),
-      onError: (e) => console.error(e)
-    });
+    try {
+      startKickReader({
+        channel: KICK_CHANNEL,
+        onChat: handleChat,
+        onStatus: (s) => console.log(s),
+        onError: (e) => console.error(e)
+      });
+    } catch (e) {
+      console.error("Kick reader failed to start:", e);
+    }
   }
 
-  // Spawn announcements loop
+  // Start spawns
   await spawnLoop();
 });
