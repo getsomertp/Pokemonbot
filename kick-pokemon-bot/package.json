@@ -7,7 +7,7 @@
     "dev": "node src/server.js",
     "start": "node src/server.js",
     "migrate": "prisma migrate deploy",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate && npx playwright install --with-deps chromium"
   },
   "dependencies": {
     "@prisma/client": "^5.18.0",
