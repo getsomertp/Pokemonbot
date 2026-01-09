@@ -161,6 +161,22 @@ function spriteUrlForSpawn(spawn) {
   }
 }
 
+function spriteUrlForName(name, { shiny = false } = {}) {
+  try {
+    if (!name) return null;
+    const d = dex.loadDex();
+    const mon = d.pokemon.find((x) => String(x.name).toLowerCase() === String(name).toLowerCase()) || d.pokemon.find((x) => x.id === name);
+    const dexNum = mon?.dex;
+    if (!dexNum) return null;
+    const base = 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon';
+    if (shiny) return `${base}/shiny/${dexNum}.png`;
+    return `${base}/${dexNum}.png`;
+  } catch {
+    return null;
+  }
+}
+
+
 function overlayEventFromSpawn(spawn) {
   if (!spawn) return { type: 'clear' };
   return {
@@ -644,6 +660,25 @@ app.get("/overlay", (req, res) => {
     #toast{position:absolute; left:50%; top:calc(50% + 125px); transform:translateX(-50%); display:none; padding:10px 14px; border-radius:14px; background:rgba(0,0,0,0.60); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:20px; white-space:nowrap;}
     #toast.show{display:block; animation: toast 1400ms ease-out both;}
     @keyframes toast{0%{transform:translate(-50%,-6px); opacity:0;} 12%{transform:translate(-50%,0); opacity:1;} 80%{opacity:1;} 100%{transform:translate(-50%,6px); opacity:0;}}
+
+    /* Battle overlay */
+    #battle{position:absolute; left:0; top:0; width:450px; height:450px; display:none; color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+    #battle.show{display:block;}
+    #battleTop{position:absolute; left:0; top:0; width:450px; height:240px;}
+    #battleBottom{position:absolute; left:0; top:190px; width:450px; height:180px;}
+    .sprite{image-rendering:pixelated;}
+    .foeSprite{position:absolute; right:28px; top:40px; width:140px; height:140px;}
+    .userSprite{position:absolute; left:28px; top:20px; width:150px; height:150px;}
+    .side{position:absolute; padding:12px 14px; border-radius:16px; background:rgba(0,0,0,0.55); backdrop-filter:blur(6px); min-width:240px;}
+    .side.foe{left:22px; top:26px;}
+    .side.user{right:22px; top:24px;}
+    .label{display:flex; justify-content:space-between; gap:10px; font-weight:800; font-size:18px; white-space:nowrap;}
+    .label span{max-width:170px; overflow:hidden; text-overflow:ellipsis;}
+    .hpWrap{margin-top:10px; width:100%; height:12px; background:rgba(255,255,255,0.20); border-radius:999px; overflow:hidden;}
+    .hp{width:100%; height:100%; background:rgba(255,255,255,0.90); transform-origin:left center;}
+    #battleText{position:absolute; left:22px; right:22px; bottom:18px; padding:14px 16px; border-radius:16px; background:rgba(0,0,0,0.65); backdrop-filter:blur(6px); font-size:18px; line-height:1.25; min-height:54px;}
+    #battle.flash{animation: battleFlash 180ms ease-out;}
+    @keyframes battleFlash{from{transform:scale(0.99); opacity:0.85;} to{transform:scale(1); opacity:1;}}
     #unlock{position:absolute; left:50%; top:16px; transform:translateX(-50%); display:none; padding:10px 14px; border-radius:12px; border:0; background:rgba(0,0,0,0.65); color:white; font-family:system-ui; font-size:14px; cursor:pointer;}
     ${showUi ? '#ui{position:absolute; right:16px; bottom:16px; background:rgba(0,0,0,0.5); color:white; padding:12px; border-radius:12px; font-family:system-ui;}' : '#ui{display:none;}'}
   </style>
@@ -658,6 +693,27 @@ app.get("/overlay", (req, res) => {
         <div id="barWrap"><div id="bar"></div></div>
       </div>
     </div>
+
+    <div id="battle">
+      <div id="battleTop">
+        <div class="side foe">
+          <div class="label"><span id="foeName"></span><span id="foeMeta"></span></div>
+          <div class="hpWrap"><div id="foeHp" class="hp"></div></div>
+        </div>
+        <img id="foeSprite" class="sprite foeSprite"/>
+      </div>
+
+      <div id="battleBottom">
+        <img id="userSprite" class="sprite userSprite"/>
+        <div class="side user">
+          <div class="label"><span id="userName"></span><span id="userMeta"></span></div>
+          <div class="hpWrap"><div id="userHp" class="hp"></div></div>
+        </div>
+      </div>
+
+      <div id="battleText"></div>
+    </div>
+
     <div id="toast"></div>
     <button id="unlock">Click to enable battle sound</button>
     <div id="ui">
@@ -681,28 +737,35 @@ app.get("/overlay", (req, res) => {
     const uiVol = document.getElementById("uiVol");
     const uiSlider = document.getElementById("uiSlider");
 
+    const battleEl = document.getElementById("battle");
+    const battleText = document.getElementById("battleText");
+    const userSprite = document.getElementById("userSprite");
+    const foeSprite = document.getElementById("foeSprite");
+    const userName = document.getElementById("userName");
+    const userMeta = document.getElementById("userMeta");
+    const foeName = document.getElementById("foeName");
+    const foeMeta = document.getElementById("foeMeta");
+    const userHp = document.getElementById("userHp");
+    const foeHp = document.getElementById("foeHp");
+
+    let battleTimer = null;
+    let battleIndex = 0;
+
     let currentSpawn = null;
     let soundEnabled = true;
     let targetVolume = 0.5;
 
-    // ---- Audio ----
-    // OBS Browser Source runs on CEF; autoplay can be blocked until a user interaction.
-    // We "prime" audio by attempting a muted play on load (muted autoplay is usually allowed),
-    // then we unmute + play when a Pokémon spawns or the user clicks unlock.
-    let primed = false;
-    async function primeAudio(){
-      if(primed) return true;
+    // WebAudio for smooth fade-out
+    let ctx = null, src = null, gain = null;
+    function ensureAudioGraph(){
+      if(ctx) return;
       try{
-        audioEl.muted = true;
-        audioEl.volume = 0;
-        await audioEl.play();
-        // tiny delay so the play() actually starts before we pause
-        setTimeout(()=>{ try{ audioEl.pause(); audioEl.currentTime = 0; }catch{} }, 50);
-        primed = true;
-        return true;
-      }catch(e){
-        return false;
-      }
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        src = ctx.createMediaElementSource(audioEl);
+        gain = ctx.createGain();
+        gain.gain.value = targetVolume;
+        src.connect(gain).connect(ctx.destination);
+      }catch(e){ ctx=null; }
     }
 
     function setVol(v){
@@ -721,47 +784,35 @@ app.get("/overlay", (req, res) => {
     }
 
     async function startLoop(){
-  if(!soundEnabled) return;
-  // Try playing normally first. If blocked, show unlock.
-  try{
-    // If we primed earlier, ensure we're unmuted and audible now.
-    audioEl.muted = false;
-    audioEl.volume = targetVolume;
-    audioEl.currentTime = 0;
-    await audioEl.play();
-    if(unlockBtn) unlockBtn.style.display = "none";
-  }catch(e){
-    // Attempt to prime (muted autoplay), then require explicit click to unmute.
-    await primeAudio();
-    if(unlockBtn) unlockBtn.style.display = "block";
-  }
-}
-
-function fadeOutAndStop(ms){
-  try{
-    const start = audioEl.volume;
-    const steps = 12;
-    let i = 0;
-    const stepMs = Math.max(16, Math.floor(ms/steps));
-    const int = setInterval(()=>{
-      i++;
-      const v = Math.max(0, start*(1 - i/steps));
-      audioEl.volume = v;
-      if(i >= steps){
-        clearInterval(int);
-        try{ audioEl.pause(); audioEl.currentTime = 0; }catch{}
-        audioEl.muted = true; // keep muted so future prime attempts are allowed
-        audioEl.volume = 0;
-        // restore "intended" volume for next startLoop
-        setTimeout(()=>{ try{ audioEl.muted = false; audioEl.volume = targetVolume; }catch{} }, 0);
+      if(!soundEnabled) return;
+      try{ ensureAudioGraph(); if(ctx && ctx.state==="suspended") await ctx.resume(); }catch{}
+      try{
+        audioEl.currentTime = 0;
+        audioEl.volume = targetVolume;
+        if(gain && ctx){ gain.gain.cancelScheduledValues(ctx.currentTime); gain.gain.setValueAtTime(targetVolume, ctx.currentTime); }
+        await audioEl.play();
+        if(unlockBtn) unlockBtn.style.display = "none";
+      }catch(e){
+        if(unlockBtn) unlockBtn.style.display = "block";
       }
-    }, stepMs);
-  }catch(e){
-    try{ audioEl.pause(); audioEl.currentTime=0; }catch{}
-  }
-}
+    }
 
-function show(spawn){
+    function fadeOutAndStop(ms){
+      try{
+        if(gain && ctx){
+          const t = ctx.currentTime;
+          gain.gain.cancelScheduledValues(t);
+          gain.gain.setValueAtTime(gain.gain.value, t);
+          gain.gain.linearRampToValueAtTime(0.0001, t + (ms/1000));
+          setTimeout(()=>{ try{ audioEl.pause(); audioEl.currentTime = 0; gain.gain.setValueAtTime(targetVolume, ctx.currentTime);}catch{} }, ms+40);
+        } else {
+          const start = audioEl.volume; const steps = 10; let i=0;
+          const int = setInterval(()=>{ i++; audioEl.volume = Math.max(0, start*(1-i/steps)); if(i>=steps){ clearInterval(int); audioEl.pause(); audioEl.currentTime=0; audioEl.volume=targetVolume;} }, Math.max(16, Math.floor(ms/steps)));
+        }
+      }catch(e){ try{ audioEl.pause(); audioEl.currentTime=0; }catch{} }
+    }
+
+    function show(spawn){
       if(!spawn || !spawn.sprite) return;
       currentSpawn = spawn;
       sprite.src = spawn.sprite;
@@ -777,6 +828,77 @@ function show(spawn){
     function caught(trainer, pokemon, isShiny){ toast.textContent = '🎮 ' + trainer + ' caught ' + (isShiny ? '✨ ' : '') + pokemon + '!'; toast.classList.remove("show"); void toast.offsetWidth; toast.classList.add("show"); clear(); }
     function despawn(){ clear(); }
 
+    function setHp(el, cur, max){
+      try{
+        const pct = max ? Math.max(0, Math.min(1, cur / max)) : 1;
+        el.style.transform = 'scaleX(' + pct + ')';
+      }catch{}
+    }
+
+    function stopBattleTimer(){
+      if(battleTimer){ clearInterval(battleTimer); battleTimer=null; }
+      battleIndex = 0;
+    }
+
+    function hideBattle(){
+      stopBattleTimer();
+      if(battleEl){ battleEl.classList.remove("show"); battleEl.style.display="none"; }
+    }
+
+    function playBattle(b){
+      if(!b || !battleEl) return;
+
+      // Hide spawn card while battling
+      card.style.display = "none";
+
+      // Fill UI
+      if(userSprite) userSprite.src = (b.user && b.user.sprite) || "";
+      if(foeSprite) foeSprite.src = (b.foe && b.foe.sprite) || "";
+      if(foeSprite && b.foe && b.foe.isShiny) foeSprite.classList.add("shiny"); else if(foeSprite) foeSprite.classList.remove("shiny");
+
+      if(userName) userName.textContent = (b.user && b.user.name) ? b.user.name : "You";
+      if(userMeta) userMeta.textContent = b.user && b.user.level ? "Lv. " + b.user.level : "";
+      if(foeName) foeName.textContent = (b.foe && b.foe.name) ? b.foe.name : "Wild";
+      if(foeMeta) foeMeta.textContent = b.foe && b.foe.level ? "Lv. " + b.foe.level : "";
+
+      const frames = Array.isArray(b.frames) ? b.frames : [];
+      // Default HP (start full)
+      const uMax = frames[0]?.leftMax || b.user?.maxHP || 100;
+      const fMax = frames[0]?.rightMax || b.foe?.maxHP || 100;
+      setHp(userHp, frames[0]?.leftHp ?? uMax, uMax);
+      setHp(foeHp, frames[0]?.rightHp ?? fMax, fMax);
+
+      battleEl.style.display = "block";
+      battleEl.classList.add("show");
+      battleEl.classList.remove("flash"); void battleEl.offsetWidth; battleEl.classList.add("flash");
+
+      stopBattleTimer();
+      battleIndex = 0;
+
+      function renderFrame(i){
+        const fr = frames[i];
+        if(!fr) return;
+        if(battleText) battleText.textContent = fr.text || "";
+        setHp(userHp, fr.leftHp ?? uMax, fr.leftMax ?? uMax);
+        setHp(foeHp, fr.rightHp ?? fMax, fr.rightMax ?? fMax);
+        battleEl.classList.remove("flash"); void battleEl.offsetWidth; battleEl.classList.add("flash");
+      }
+
+      renderFrame(0);
+
+      battleTimer = setInterval(()=>{
+        battleIndex++;
+        if(battleIndex >= frames.length){
+          stopBattleTimer();
+          // leave battle visible briefly, then hide
+          setTimeout(()=>{ hideBattle(); }, 600);
+          return;
+        }
+        renderFrame(battleIndex);
+      }, 650);
+    }
+
+
     function tickBar(){
       try{
         if(!currentSpawn || !currentSpawn.spawnedAt || !currentSpawn.expiresAt){ requestAnimationFrame(tickBar); return; }
@@ -790,32 +912,15 @@ function show(spawn){
     }
     tickBar();
 
-    // unlock audio via click (requires OBS "Interact" to click the browser source)
-async function unlockAndPlay(){
-  try{ await primeAudio(); }catch{}
-  try{
-    audioEl.muted = false;
-    audioEl.volume = targetVolume;
-    audioEl.currentTime = 0;
-    await audioEl.play();
-    if(unlockBtn) unlockBtn.style.display = "none";
-  }catch(e){
-    if(unlockBtn) unlockBtn.style.display = "block";
-  }
-}
+    // unlock audio via click
+    if(unlockBtn){
+      unlockBtn.addEventListener("click", async ()=>{
+        try{ ensureAudioGraph(); if(ctx && ctx.state==="suspended") await ctx.resume(); }catch{}
+        startLoop();
+      });
+    }
 
-if(unlockBtn){
-  unlockBtn.addEventListener("click", unlockAndPlay);
-}
-// Also treat any click on the overlay as an unlock gesture (helpful in OBS).
-document.addEventListener("click", ()=>{
-  if(unlockBtn && unlockBtn.style.display !== "none") unlockAndPlay();
-}, { passive:true });
-
-// Prime audio on load (muted autoplay)
-setTimeout(()=>{ primeAudio(); }, 0);
-
-// Optional UI slider (if ?ui=1) (if ?ui=1)
+    // Optional UI slider (if ?ui=1)
     if(uiSlider){ uiSlider.oninput = ()=>{ setVol(Number(uiSlider.value)/100); }; }
 
     const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -823,9 +928,10 @@ setTimeout(()=>{ primeAudio(); }, 0);
     ws.onmessage = (e)=>{
       try{
         const msg = JSON.parse(e.data);
-        if(msg.type === "spawn") show(msg.spawn);
-        if(msg.type === "clear") clear();
-        if(msg.type === "despawn") despawn();
+        if(msg.type === "spawn") { hideBattle(); show(msg.spawn); }
+        if(msg.type === "battle" && msg.battle) playBattle(msg.battle);
+        if(msg.type === "clear") { hideBattle(); clear(); }
+        if(msg.type === "despawn") { hideBattle(); despawn(); }
         if(msg.type === "caught") caught(msg.trainer || "Someone", msg.pokemon || "a Pokémon", !!msg.isShiny);
         if(msg.type === "sound_settings" && msg.settings){ setEnabled(msg.settings.enabled); setVol(msg.settings.volume); }
       }catch{}
@@ -1033,6 +1139,123 @@ async function handleChat({ username, userId, content }) {
       await refreshKickTokenIfNeeded();
       await sendKickChatMessage(`🎒 ${username} — LeaderPts: ${leaderPts} | Recent: ${list}`);
     } catch {}
+    return;
+  }
+
+  // !use <pokemon>  (sets your active battle Pokémon; picks your highest level of that species)
+  if (lower === `${PREFIX}use` || lower.startsWith(`${PREFIX}use `) || lower === `${PREFIX}pick` || lower.startsWith(`${PREFIX}pick `)) {
+    const arg = msg.split(/\s+/).slice(1).join(" ").trim();
+    const user = await game.getOrCreateKickUser(username, userId);
+    if (!arg) {
+      await game.setActivePokemon(user.id, "");
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — active battle Pokémon cleared. I'll use your highest level catch by default.`); } catch {}
+      return;
+    }
+
+    // Verify they actually own it (at least one catch)
+    const owned = await prisma.catch.findFirst({ where: { userId: user.id, pokemon: { equals: arg, mode: "insensitive" } } });
+    if (!owned) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — you don't have a ${arg} yet. Catch one first!`); } catch {}
+      return;
+    }
+
+    await game.setActivePokemon(user.id, arg);
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — set active battle Pokémon to ${owned.pokemon}${owned.level ? ` (best Lv.${owned.level})` : ""}.`); } catch {}
+    return;
+  }
+
+  // !battle  (fight the current spawn with your selected Pokémon; 1v1 for now)
+  if (lower === `${PREFIX}battle` || lower === `${PREFIX}fight`) {
+    const result = await game.battleActiveSpawn({ username, platformUserId: userId });
+
+    if (!result.ok) {
+      if (result.reason === "no_spawn") {
+        try { await refreshKickTokenIfNeeded(); await sendKickChatMessage("No Pokémon active right now."); } catch {}
+        return;
+      }
+      if (result.reason === "no_team") {
+        try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — you have no caught Pokémon to battle with yet. Catch something first!`); } catch {}
+        return;
+      }
+      if (result.reason === "already_caught") return;
+      return;
+    }
+
+    const s = result.spawn;
+    const shinyTag = s.isShiny ? " ✨SHINY✨" : "";
+    const lvlTag = s.level ? `Lv. ${s.level} ` : "";
+
+    if (result.result === "lost") {
+      const logLine = (result.log || []).slice(0, 3).join(" ");
+      try {
+        await refreshKickTokenIfNeeded();
+        await sendKickChatMessage(
+          `⚔️ ${username}'s ${result.userMon.name} lost to ${lvlTag}${s.pokemon}${shinyTag}. ${logLine}`.trim()
+        );
+      } catch {}
+      return;
+    }
+
+    // won -> guaranteed catch already recorded
+    const logLine = (result.log || []).slice(0, 3).join(" ");
+    try {
+      await refreshKickTokenIfNeeded();
+      await sendKickChatMessage(
+        `🏁 ${username}'s ${result.userMon.name} defeated ${lvlTag}${s.pokemon}${shinyTag}! Caught for ${result.catch.pointsEarned} pts. ${logLine}`.trim()
+      );
+    } catch {}
+
+    // Notify overlay: play battle animation, then show caught/clear if won
+    try {
+      const frames = (result.events || result.simEvents || result.frames || []).slice(0, 18);
+      overlayBroadcast({
+        type: "battle",
+        battle: {
+          trainer: username,
+          user: {
+            name: result.userMon?.name || "Your Pokémon",
+            level: result.userMon?.level || undefined,
+            sprite: spriteUrlForName(result.userMon?.name),
+            hp: result.userMon?.maxHP ? result.userMon?.hp : undefined,
+            maxHP: result.userMon?.maxHP
+          },
+          foe: {
+            name: s.pokemon,
+            level: s.level || 5,
+            sprite: spriteUrlForSpawn(s),
+            isShiny: !!s.isShiny,
+            tier: s.tier
+          },
+          frames
+        }
+      });
+
+      // If the user won, delay the caught flash until after the battle animation
+      if (result.result === "won") {
+        setTimeout(() => {
+          try {
+            overlayBroadcast({
+              type: "caught",
+              spawnId: s.id,
+              trainer: username,
+              pokemon: s.pokemon,
+              isShiny: !!s.isShiny,
+              sprite: spriteUrlForSpawn(s)
+            });
+            overlayBroadcast({ type: "clear" });
+            overlayLastSpawn = null;
+          } catch {}
+        }, 6500);
+      } else {
+        // Lost: return to spawn card after animation
+        setTimeout(() => {
+          try {
+            overlayBroadcast(overlayEventFromSpawn(overlayLastSpawn));
+          } catch {}
+        }, 6500);
+      }
+    } catch {}
+
     return;
   }
 

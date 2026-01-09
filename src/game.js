@@ -3,6 +3,8 @@ const { envInt } = require("./util");
 const { pickTier } = require("./spawnTables");
 const { computePoints } = require("./points");
 
+const { simulateBattle, buildBattleMonFromDex } = require("./battle");
+
 // Gen 1 dex helpers (reads data/gen1.dex.json)
 const dex = require("./dex");
 
@@ -12,6 +14,10 @@ function randInt(max) {
 
 function leaderAdjKey(userId) {
   return `lp_adj:${userId}`;
+}
+
+function activeMonKey(userId) {
+  return `active_mon:${userId}`;
 }
 
 async function getLeaderAdj(userId) {
@@ -274,6 +280,158 @@ class Game {
       points: (totalPoints._sum.pointsEarned || 0) + (await getLeaderAdj(ident.user.id)),
       catches: totalCatches,
       shinies: totalShinies
+    };
+  }
+
+  // ---- Team selection (1 mon for now) ----
+  async setActivePokemon(userId, pokemonNameOrId) {
+    const key = activeMonKey(userId);
+    const val = String(pokemonNameOrId || "").trim();
+    if (!val) {
+      await prisma.setting.delete({ where: { key } }).catch(() => {});
+      return null;
+    }
+    await prisma.setting.upsert({
+      where: { key },
+      update: { value: val },
+      create: { key, value: val }
+    });
+    return val;
+  }
+
+  async getActivePokemonChoice(userId) {
+    const row = await prisma.setting.findUnique({ where: { key: activeMonKey(userId) } });
+    return row?.value ? String(row.value) : null;
+  }
+
+  /**
+   * Pick the user's battle mon from their catches.
+   * - If they chose a species via !use, pick the highest level of that species.
+   * - Otherwise, pick their highest level catch.
+   */
+  async getUserBattleMon(userId) {
+    const choice = await this.getActivePokemonChoice(userId);
+    const where = { userId };
+    const rows = await prisma.catch.findMany({
+      where,
+      orderBy: [{ level: "desc" }, { caughtAt: "desc" }],
+      take: 200
+    });
+    if (!rows.length) return null;
+
+    let pick = null;
+    if (choice) {
+      const c = String(choice).toLowerCase();
+      pick = rows.find((r) => String(r.pokemon || "").toLowerCase() === c);
+    }
+    if (!pick) pick = rows[0];
+
+    const lvl = pick.level || 5;
+    const mon = buildBattleMonFromDex({ nameOrId: pick.pokemon, level: lvl });
+    return mon;
+  }
+
+  /**
+   * Battle the active spawn with the user's selected Pokémon.
+   * If the user wins, we award a guaranteed catch (like a "battle-catch").
+   */
+  async battleActiveSpawn({ username, platformUserId }) {
+    const spawn = await this.getActiveSpawn();
+    if (!spawn) return { ok: false, reason: "no_spawn" };
+
+    const user = await this.getOrCreateKickUser(username, platformUserId);
+    const userMon = await this.getUserBattleMon(user.id);
+    if (!userMon) return { ok: false, reason: "no_team" };
+
+    // Build wild mon from stored spawn stats/moves if available, else from dex.
+    const wild = {
+      name: spawn.pokemon,
+      level: spawn.level || 5,
+      types: [],
+      stats: spawn.statsJson || null,
+      moves: spawn.movesJson || null
+    };
+    if (!wild.stats || !wild.moves) {
+      const rebuilt = buildBattleMonFromDex({ nameOrId: spawn.pokemonId || spawn.pokemon, level: spawn.level || 5 });
+      if (rebuilt) {
+        wild.types = rebuilt.types;
+        wild.stats = rebuilt.stats;
+        wild.moves = rebuilt.moves;
+      }
+    } else {
+      // types aren't stored on spawn, so rebuild just for types
+      const rebuilt = buildBattleMonFromDex({ nameOrId: spawn.pokemonId || spawn.pokemon, level: spawn.level || 5 });
+      if (rebuilt) wild.types = rebuilt.types;
+    }
+
+    const sim = simulateBattle(userMon, wild);
+    const userWon = sim.winner === "left";
+
+    if (!userWon) {
+      return {
+        ok: true,
+        result: "lost",
+        userMon: sim.left,
+        wildMon: sim.right,
+        log: sim.log,
+        events: sim.events,
+        spawn
+      };
+    }
+
+    // User won: do a guaranteed catch transaction (only one person can win/catch)
+    const now = new Date();
+    const speedMs = now.getTime() - new Date(spawn.spawnedAt).getTime();
+
+    // modest points for battling; catching points still apply
+    const battleBonus = 3;
+
+    const result = await prisma.$transaction(async (tx) => {
+      const fresh = await tx.spawn.findUnique({ where: { id: spawn.id } });
+      if (!fresh || fresh.caughtAt) return { ok: false, reason: "already_caught" };
+
+      await tx.spawn.update({
+        where: { id: spawn.id },
+        data: { caughtAt: now, caughtBy: user.id }
+      });
+
+      // Use your existing points logic but add a small bonus for winning a battle
+      let pointsEarned = computePoints({
+        tier: spawn.tier,
+        isShiny: spawn.isShiny,
+        speedMs,
+        streak: 0
+      });
+      pointsEarned += Math.floor((spawn.level || 5) / 5);
+      pointsEarned += battleBonus;
+
+      const c = await tx.catch.create({
+        data: {
+          userId: user.id,
+          spawnId: spawn.id,
+          pokemon: spawn.pokemon,
+          tier: spawn.tier,
+          isShiny: spawn.isShiny,
+          level: spawn.level,
+          pointsEarned,
+          speedMs
+        }
+      });
+
+      return { ok: true, catch: c };
+    });
+
+    if (!result.ok) return result;
+
+    return {
+      ok: true,
+      result: "won",
+      userMon: sim.left,
+      wildMon: sim.right,
+      log: sim.log,
+        events: sim.events,
+      spawn,
+      catch: result.catch
     };
   }
 }
