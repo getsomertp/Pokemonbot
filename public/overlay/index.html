@@ -1,0 +1,83 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Pokemon Overlay</title>
+  <style>
+    body { margin:0; background:transparent; overflow:hidden; }
+    #sprite { width:260px; filter: drop-shadow(0 0 25px gold); }
+    #bar { width:300px; height:12px; background:#333; margin-top:8px; }
+    #fill { height:100%; width:100%; background:lime; transition: width 1s linear; }
+    #catch { font-family: sans-serif; color:white; font-size:22px; margin-top:10px; }
+  </style>
+</head>
+<body>
+  <img id="sprite" />
+  <div id="bar"><div id="fill"></div></div>
+  <div id="catch"></div>
+
+  <audio id="music" src="/sounds/wild_battle.mp3" loop preload="auto"></audio>
+
+  <script>
+    const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/overlay/ws");
+    const sprite = document.getElementById("sprite");
+    const fill = document.getElementById("fill");
+    const catchEl = document.getElementById("catch");
+    const music = document.getElementById("music");
+
+    let audioCtx, gain;
+
+    function initAudio() {
+      if (audioCtx) return;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      gain = audioCtx.createGain();
+      gain.gain.value = 0.7;
+      const src = audioCtx.createMediaElementSource(music);
+      src.connect(gain).connect(audioCtx.destination);
+    }
+
+    function playMusic() {
+      initAudio();
+      if (audioCtx.state === "suspended") audioCtx.resume();
+      music.currentTime = 0;
+      music.play().catch(()=>{});
+    }
+
+    function fadeOut() {
+      if (!gain) return;
+      const t = audioCtx.currentTime;
+      gain.gain.setValueAtTime(gain.gain.value, t);
+      gain.gain.linearRampToValueAtTime(0.001, t + 0.6);
+      setTimeout(() => {
+        music.pause();
+        music.currentTime = 0;
+        gain.gain.value = 0.7;
+      }, 650);
+    }
+
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === "spawn") {
+        sprite.src = msg.sprite;
+        sprite.style.display = "block";
+        fill.style.width = "100%";
+        playMusic();
+        let ttl = msg.ttl || 45000;
+        let start = Date.now();
+        const i = setInterval(() => {
+          const p = Math.max(0, 1 - (Date.now() - start) / ttl);
+          fill.style.width = (p * 100) + "%";
+          if (p <= 0) clearInterval(i);
+        }, 1000);
+      }
+      if (msg.type === "caught") {
+        catchEl.textContent = msg.user + " caught it!";
+        fadeOut();
+      }
+      if (msg.type === "despawn") {
+        fadeOut();
+      }
+    };
+  </script>
+</body>
+</html>
