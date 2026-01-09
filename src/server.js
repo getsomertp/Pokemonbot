@@ -678,7 +678,7 @@ app.get("/overlay", (req, res) => {
     .pop{animation: pop 300ms ease-out;}
     @keyframes pop{from{transform:translate(-50%,-50%) scale(0.85); opacity:0;} to{transform:translate(-50%,-50%) scale(1); opacity:1;}}
     #barWrap{margin-top:10px; width:260px; height:10px; background:rgba(255,255,255,0.20); border-radius:999px; overflow:hidden;}
-    #bar{width:100%; height:100%; background:rgba(255,255,255,0.85); transform-origin:left center;}
+    #bar{width:100%; height:100%; background:rgba(255,255,255,0.85); transform-origin:left center; transition: transform 220ms linear;}
     #toast{position:absolute; left:50%; top:calc(50% + 125px); transform:translateX(-50%); display:none; padding:10px 14px; border-radius:14px; background:rgba(0,0,0,0.60); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:20px; white-space:nowrap;}
     #toast.show{display:block; animation: toast 1400ms ease-out both;}
     @keyframes toast{0%{transform:translate(-50%,-6px); opacity:0;} 12%{transform:translate(-50%,0); opacity:1;} 80%{opacity:1;} 100%{transform:translate(-50%,6px); opacity:0;}}
@@ -703,7 +703,7 @@ app.get("/overlay", (req, res) => {
     .label{display:flex; justify-content:space-between; gap:10px; font-weight:800; font-size:18px; white-space:nowrap;}
     .label span{max-width:170px; overflow:hidden; text-overflow:ellipsis;}
     .hpWrap{margin-top:10px; width:100%; height:12px; background:rgba(255,255,255,0.20); border-radius:999px; overflow:hidden;}
-    .hp{width:100%; height:100%; background:rgba(255,255,255,0.90); transform-origin:left center;}
+    .hp{width:100%; height:100%; background:rgba(255,255,255,0.90); transform-origin:left center; transition: transform 520ms linear;}
     #battleText{position:absolute; left:22px; right:22px; bottom:18px; padding:14px 16px; border-radius:16px; background:rgba(0,0,0,0.65); backdrop-filter:blur(6px); font-size:18px; line-height:1.25; min-height:54px;}
     #battle.flash{animation: battleFlash 180ms ease-out;}
     @keyframes battleFlash{from{transform:scale(0.99); opacity:0.85;} to{transform:scale(1); opacity:1;}}
@@ -1049,9 +1049,11 @@ function scheduleNext(){
   }
   renderFrame(battleIndex);
   const fr = frames[battleIndex];
-  const ms = Math.max(120, Number(fr?.durationMs || 1000));
+  const ms = Math.max(250, Number(fr?.durationMs || 1000));
+  // Small gap between frames so the viewer perceives a clear back-and-forth "turn" rhythm.
+  const gap = 180;
   battleIndex++;
-  battleTimer = setTimeout(scheduleNext, ms);
+  battleTimer = setTimeout(scheduleNext, ms + gap);
 }
 
 stopBattleTimer();

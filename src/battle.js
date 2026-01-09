@@ -143,8 +143,9 @@ function simulateBattle(a, b, rng = defaultRng) {
 
   // Opening sequence (lets overlay do "send out" animations)
   // Slightly slower pacing so OBS viewers can read each line.
-  pushEvent(`A wild ${right.name} appeared!`, { kind: "start", defender: "R" }, 1400);
-  pushEvent(`Go! ${left.name}!`, { kind: "sendout", attacker: "L" }, 1400);
+  // A bit slower so the viewer can register the scene.
+  pushEvent(`A wild ${right.name} appeared!`, { kind: "start", defender: "R" }, 1600);
+  pushEvent(`Go! ${left.name}!`, { kind: "sendout", attacker: "L" }, 1600);
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (left.hp <= 0 || right.hp <= 0) break;
@@ -175,20 +176,21 @@ function simulateBattle(a, b, rng = defaultRng) {
 
       // 1) "X used MOVE!"
       // "X used MOVE!" gets its own beat, like the mainline games.
-      pushEvent(`${att.name} used ${mv.name}!`, { kind: "use", attacker: attSide, defender: defSide, moveName: mv.name }, 1600);
+      // Give the "used" line enough time to read.
+      pushEvent(`${att.name} used ${mv.name}!`, { kind: "use", attacker: attSide, defender: defSide, moveName: mv.name }, 1900);
       if (turn <= 6) log.push(`${att.name} used ${mv.name}!`);
 
       const res = calcDamage({ attacker: att, defender: def, move: mv, rng });
 
       // 2) Outcome frame (damage/effectiveness/etc)
       if (!res.hit) {
-        pushEvent(`But it missed!`, { kind: "miss", attacker: attSide, defender: defSide, moveName: mv.name }, 1600);
+        pushEvent(`But it missed!`, { kind: "miss", attacker: attSide, defender: defSide, moveName: mv.name }, 1800);
         if (turn <= 6) log.push("But it missed!");
         continue;
       }
 
       if (res.mult === 0) {
-        pushEvent(`It had no effect!`, { kind: "noeffect", attacker: attSide, defender: defSide, moveName: mv.name, mult: 0 }, 1600);
+        pushEvent(`It had no effect!`, { kind: "noeffect", attacker: attSide, defender: defSide, moveName: mv.name, mult: 0 }, 1800);
         if (turn <= 6) log.push("It had no effect!");
         continue;
       }
@@ -201,14 +203,15 @@ function simulateBattle(a, b, rng = defaultRng) {
       if (res.mult >= 2) lines.push("It's super effective!");
       else if (res.mult > 0 && res.mult <= 0.5) lines.push("It's not very effective…");
 
-      pushEvent(lines.join("\n"), { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult }, 1600);
+      // Separate outcome beat: damage + crit/effectiveness + HP bar ticks down.
+      pushEvent(lines.join("\n"), { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult }, 1900);
       if (turn <= 6) log.push(lines.join(" "));
 
       // Tiny pause before KO/final texts (feels more like Pokémon)
       if (def.hp <= 0) {
         // A tiny breath before the KO text.
-        pushEvent("", { kind: "pause" }, 800);
-        pushEvent(`${def.name} fainted!`, { kind: "faint", attacker: attSide, defender: defSide }, 1600);
+        pushEvent("", { kind: "pause" }, 900);
+        pushEvent(`${def.name} fainted!`, { kind: "faint", attacker: attSide, defender: defSide }, 1800);
         break;
       }
     }
@@ -221,8 +224,8 @@ function simulateBattle(a, b, rng = defaultRng) {
     : "right";
 
   // Small pause before the win text
-  pushEvent("", { kind: "pause" }, 800);
-  pushEvent(winner === "left" ? `${left.name} wins!` : `${right.name} wins!`, { kind: "end" }, 1700);
+  pushEvent("", { kind: "pause" }, 900);
+  pushEvent(winner === "left" ? `${left.name} wins!` : `${right.name} wins!`, { kind: "end" }, 2000);
 
   return {
     winner,
