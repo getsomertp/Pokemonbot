@@ -116,18 +116,33 @@ function simulateBattle(a, b, rng = defaultRng) {
   const events = [];
   const maxTurns = 50;
 
-  function pushEvent(text) {
+  /**
+   * Push an animation frame for the overlay.
+   * `action` is optional, and lets the overlay drive shake/flash/popups.
+   *
+   * action: {
+   *   kind: 'start'|'hit'|'miss'|'noeffect'|'faint'|'end',
+   *   attacker: 'L'|'R',
+   *   defender: 'L'|'R',
+   *   moveName?: string,
+   *   damage?: number,
+   *   crit?: boolean,
+   *   mult?: number
+   * }
+   */
+  function pushEvent(text, action) {
     events.push({
       text,
       leftHp: left.hp,
       leftMax: left.maxHP,
       rightHp: right.hp,
-      rightMax: right.maxHP
+      rightMax: right.maxHP,
+      action: action || null
     });
   }
 
   // Initial frame
-  pushEvent(`A wild ${right.name} appeared!`);
+  pushEvent(`A wild ${right.name} appeared!`, { kind: "start" });
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (left.hp <= 0 || right.hp <= 0) break;
@@ -149,10 +164,10 @@ function simulateBattle(a, b, rng = defaultRng) {
           : (rng() < 0.5 ? "L" : "R");
 
     const order = first === "L"
-      ? [[left, right, lMove], [right, left, rMove]]
-      : [[right, left, rMove], [left, right, lMove]];
+      ? [["L", left, "R", right, lMove], ["R", right, "L", left, rMove]]
+      : [["R", right, "L", left, rMove], ["L", left, "R", right, lMove]];
 
-    for (const [att, def, mv] of order) {
+    for (const [attSide, att, defSide, def, mv] of order) {
       if (att.hp <= 0 || def.hp <= 0) continue;
       if (!mv) continue;
 
@@ -160,13 +175,13 @@ function simulateBattle(a, b, rng = defaultRng) {
       if (!res.hit) {
         const t = `${att.name} used ${mv.name}… but missed!`;
         if (turn <= 6) log.push(t);
-        pushEvent(t);
+        pushEvent(t, { kind: "miss", attacker: attSide, defender: defSide, moveName: mv.name });
         continue;
       }
       if (res.mult === 0) {
         const t = `${att.name} used ${mv.name}… no effect!`;
         if (turn <= 6) log.push(t);
-        pushEvent(t);
+        pushEvent(t, { kind: "noeffect", attacker: attSide, defender: defSide, moveName: mv.name, mult: 0 });
         continue;
       }
 
@@ -177,11 +192,11 @@ function simulateBattle(a, b, rng = defaultRng) {
       const t = `${att.name} used ${mv.name}! (-${res.damage})${crit}${eff}`;
 
       if (turn <= 6) log.push(t);
-      pushEvent(t);
+      pushEvent(t, { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult });
 
       if (def.hp <= 0) {
         const faint = `${def.name} fainted!`;
-        pushEvent(faint);
+        pushEvent(faint, { kind: "faint", attacker: attSide, defender: defSide });
         break;
       }
     }
@@ -193,7 +208,7 @@ function simulateBattle(a, b, rng = defaultRng) {
     : left.hp >= right.hp ? "left"
     : "right";
 
-  pushEvent(winner === "left" ? `${left.name} wins!` : `${right.name} wins!`);
+  pushEvent(winner === "left" ? `${left.name} wins!` : `${right.name} wins!`, { kind: "end" });
 
   return {
     winner,

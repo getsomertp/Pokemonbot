@@ -679,6 +679,23 @@ app.get("/overlay", (req, res) => {
     #battleText{position:absolute; left:22px; right:22px; bottom:18px; padding:14px 16px; border-radius:16px; background:rgba(0,0,0,0.65); backdrop-filter:blur(6px); font-size:18px; line-height:1.25; min-height:54px;}
     #battle.flash{animation: battleFlash 180ms ease-out;}
     @keyframes battleFlash{from{transform:scale(0.99); opacity:0.85;} to{transform:scale(1); opacity:1;}}
+
+    /* Damage feedback */
+    .shake{animation: shake 260ms ease-in-out;}
+    @keyframes shake{
+      0%{transform:translate(0,0);} 15%{transform:translate(-6px,0);} 30%{transform:translate(6px,0);} 45%{transform:translate(-5px,0);} 60%{transform:translate(5px,0);} 75%{transform:translate(-3px,0);} 100%{transform:translate(0,0);} 
+    }
+    .hitFlash{animation: hitFlash 180ms ease-out;}
+    @keyframes hitFlash{from{filter:brightness(1.9) contrast(1.05);} to{filter:brightness(1) contrast(1);}}
+
+    /* Effectiveness / crit popup */
+    #popup{position:absolute; left:50%; top:160px; transform:translateX(-50%); display:none; padding:10px 14px; border-radius:14px; background:rgba(0,0,0,0.70); backdrop-filter:blur(6px); font-weight:900; letter-spacing:0.5px; font-size:20px; text-transform:uppercase; white-space:nowrap;}
+    #popup.show{display:block; animation: popup 850ms ease-out both;}
+    @keyframes popup{0%{transform:translate(-50%,8px) scale(0.92); opacity:0;} 18%{transform:translate(-50%,0) scale(1); opacity:1;} 80%{opacity:1;} 100%{transform:translate(-50%,-6px) scale(1); opacity:0;}}
+
+    /* Small move log */
+    #moveLog{position:absolute; left:22px; right:22px; bottom:92px; padding:10px 12px; border-radius:14px; background:rgba(0,0,0,0.45); backdrop-filter:blur(6px); font-size:13px; line-height:1.25; max-height:76px; overflow:hidden;}
+    #moveLog .line{opacity:0.95; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
     #unlock{position:absolute; left:50%; top:16px; transform:translateX(-50%); display:none; padding:10px 14px; border-radius:12px; border:0; background:rgba(0,0,0,0.65); color:white; font-family:system-ui; font-size:14px; cursor:pointer;}
     ${showUi ? '#ui{position:absolute; right:16px; bottom:16px; background:rgba(0,0,0,0.5); color:white; padding:12px; border-radius:12px; font-family:system-ui;}' : '#ui{display:none;}'}
   </style>
@@ -711,6 +728,8 @@ app.get("/overlay", (req, res) => {
         </div>
       </div>
 
+      <div id="popup"></div>
+      <div id="moveLog"></div>
       <div id="battleText"></div>
     </div>
 
@@ -747,6 +766,10 @@ app.get("/overlay", (req, res) => {
     const foeMeta = document.getElementById("foeMeta");
     const userHp = document.getElementById("userHp");
     const foeHp = document.getElementById("foeHp");
+    const popup = document.getElementById("popup");
+    const moveLog = document.getElementById("moveLog");
+
+    let moveLines = [];
 
     let battleTimer = null;
     let battleIndex = 0;
@@ -842,7 +865,33 @@ app.get("/overlay", (req, res) => {
 
     function hideBattle(){
       stopBattleTimer();
+      moveLines = [];
+      if(moveLog) moveLog.innerHTML = "";
+      if(popup) popup.classList.remove("show");
       if(battleEl){ battleEl.classList.remove("show"); battleEl.style.display="none"; }
+    }
+
+    function pulse(el, cls){
+      if(!el) return;
+      el.classList.remove(cls);
+      void el.offsetWidth;
+      el.classList.add(cls);
+      setTimeout(()=>{ try{ el.classList.remove(cls); }catch{} }, 320);
+    }
+
+    function showPopup(text){
+      if(!popup || !text) return;
+      popup.textContent = text;
+      popup.classList.remove("show");
+      void popup.offsetWidth;
+      popup.classList.add("show");
+    }
+
+    function pushMoveLine(line){
+      if(!moveLog || !line) return;
+      moveLines.push(line);
+      if(moveLines.length > 5) moveLines = moveLines.slice(moveLines.length - 5);
+      moveLog.innerHTML = moveLines.map(l => '<div class="line">' + l.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>').join('');
     }
 
     function playBattle(b){
@@ -874,6 +923,9 @@ app.get("/overlay", (req, res) => {
 
       stopBattleTimer();
       battleIndex = 0;
+      moveLines = [];
+      if(moveLog) moveLog.innerHTML = "";
+      if(popup) popup.classList.remove("show");
 
       function renderFrame(i){
         const fr = frames[i];
@@ -882,6 +934,43 @@ app.get("/overlay", (req, res) => {
         setHp(userHp, fr.leftHp ?? uMax, fr.leftMax ?? uMax);
         setHp(foeHp, fr.rightHp ?? fMax, fr.rightMax ?? fMax);
         battleEl.classList.remove("flash"); void battleEl.offsetWidth; battleEl.classList.add("flash");
+
+        // Enhanced animation events (new frames include fr.action)
+        const a = fr.action || null;
+        if(a){
+          const atkName = a.attacker === 'L' ? (b.user?.name || 'You') : (b.foe?.name || 'Wild');
+          const defSprite = a.defender === 'L' ? userSprite : foeSprite;
+
+          if(a.kind === 'hit'){
+            // Turn-by-turn shake/flash on damage
+            pulse(defSprite, 'shake');
+            pulse(defSprite, 'hitFlash');
+
+            // Move log
+            const dmg = (a.damage != null) ? (' -' + a.damage) : '';
+            let effTag = '';
+            if(a.mult >= 4) effTag = ' (SUPER!)';
+            else if(a.mult === 2) effTag = ' (SUPER)';
+            else if(a.mult > 0 && a.mult <= 0.5) effTag = ' (RESIST)';
+            const critTag = a.crit ? ' (CRIT)' : '';
+            pushMoveLine(atkName + ' used ' + (a.moveName || 'a move') + dmg + effTag + critTag);
+
+            // Type effectiveness popup
+            if(a.mult >= 2) showPopup('SUPER EFFECTIVE!');
+            else if(a.mult > 0 && a.mult <= 0.5) showPopup('NOT VERY EFFECTIVE…');
+            else if(a.crit) showPopup('CRITICAL HIT!');
+          }
+
+          if(a.kind === 'miss'){
+            pushMoveLine(atkName + ' missed ' + (a.moveName || 'a move') + '!');
+            showPopup('MISS!');
+          }
+
+          if(a.kind === 'noeffect'){
+            pushMoveLine(atkName + ' used ' + (a.moveName || 'a move') + ' (NO EFFECT)');
+            showPopup('NO EFFECT!');
+          }
+        }
       }
 
       renderFrame(0);
