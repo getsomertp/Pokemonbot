@@ -12,13 +12,23 @@ function randInt(max) {
 
 class Game {
   constructor() {
-    this.spawnIntervalSeconds = envInt("SPAWN_INTERVAL_SECONDS", 90);
+    // Randomized spawn pacing is controlled by the server scheduler.
+    // These defaults are also exposed for convenience.
+    this.spawnDelayMinSeconds = envInt("SPAWN_DELAY_MIN_SECONDS", 60); // 1 minute
+    this.spawnDelayMaxSeconds = envInt("SPAWN_DELAY_MAX_SECONDS", 900); // 15 minutes
     this.despawnSeconds = envInt("DESPAWN_SECONDS", 45);
     this.shinyOdds = envInt("SHINY_ODDS", 512);
 
     // optional tuning
     this.levelMin = envInt("LEVEL_MIN", 3);
     this.levelMax = envInt("LEVEL_MAX", 75);
+  }
+
+  nextSpawnDelayMs() {
+    const min = Math.max(5, this.spawnDelayMinSeconds);
+    const max = Math.max(min, this.spawnDelayMaxSeconds);
+    const secs = min + Math.floor(Math.random() * (max - min + 1));
+    return secs * 1000;
   }
 
   async getOrCreateKickUser(username, platformUserId = null) {

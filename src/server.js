@@ -91,6 +91,87 @@ async function setSoundSettings(streamer, { enabled, volume }) {
   return cur;
 }
 
+// ---- Economy (coins) + Betting ----
+// Uses the Setting table for simplicity (no new migrations required).
+// Keys:
+//  - coins:<userId> => number
+//  - bet:<spawnId>:<userId> => wager amount
+
+function coinsKey(userId) {
+  return `coins:${userId}`;
+}
+
+function betKey(spawnId, userId) {
+  return `bet:${spawnId}:${userId}`;
+}
+
+async function getCoins(userId) {
+  const row = await prisma.setting.findUnique({ where: { key: coinsKey(userId) } });
+  if (!row?.value) return envInt("STARTING_COINS", 1000);
+  const n = Number(row.value);
+  return Number.isFinite(n) ? n : envInt("STARTING_COINS", 1000);
+}
+
+async function setCoins(userId, amount) {
+  const n = Math.max(0, Math.floor(Number(amount) || 0));
+  await prisma.setting.upsert({
+    where: { key: coinsKey(userId) },
+    update: { value: String(n) },
+    create: { key: coinsKey(userId), value: String(n) }
+  });
+  return n;
+}
+
+async function addCoins(userId, delta) {
+  const cur = await getCoins(userId);
+  return setCoins(userId, cur + (Number(delta) || 0));
+}
+
+function payoutMultiplierForSpawn(spawn) {
+  // Tune to taste via env vars later.
+  const tier = String(spawn?.tier || "common").toLowerCase();
+  const baseByTier = {
+    common: 1.5,
+    uncommon: 2,
+    rare: 3,
+    epic: 5,
+    legendary: 8
+  };
+  const base = baseByTier[tier] || 1.5;
+  const shinyMult = spawn?.isShiny ? 3 : 1;
+  return base * shinyMult;
+}
+
+async function refundBetsForSpawn(spawnId) {
+  const bets = await prisma.setting.findMany({ where: { key: { startsWith: `bet:${spawnId}:` } } });
+  for (const b of bets) {
+    const parts = String(b.key).split(":");
+    const userId = parts[2];
+    const amt = Math.max(0, Math.floor(Number(b.value) || 0));
+    if (userId && amt > 0) {
+      await addCoins(userId, amt);
+    }
+    await prisma.setting.delete({ where: { key: b.key } }).catch(() => {});
+  }
+}
+
+async function settleBetsOnCatch(spawn, catcherUserId) {
+  const bets = await prisma.setting.findMany({ where: { key: { startsWith: `bet:${spawn.id}:` } } });
+  if (!bets.length) return;
+
+  const mult = payoutMultiplierForSpawn(spawn);
+  for (const b of bets) {
+    const parts = String(b.key).split(":");
+    const userId = parts[2];
+    const amt = Math.max(0, Math.floor(Number(b.value) || 0));
+    if (userId && amt > 0 && userId === catcherUserId) {
+      const payout = Math.max(0, Math.floor(amt * mult));
+      await addCoins(userId, payout);
+    }
+    await prisma.setting.delete({ where: { key: b.key } }).catch(() => {});
+  }
+}
+
 function spriteUrlForSpawn(spawn) {
   try {
     if (!spawn) return null;
@@ -325,6 +406,13 @@ async function announceSpawn(spawn) {
         const stillActiveSame = active && active.id === spawn.id;
         if (stillActiveSame) return;
 
+        // If it was caught, do not refund bets here (they are settled on catch).
+        const latest = await prisma.spawn.findUnique({ where: { id: spawn.id } }).catch(() => null);
+        if (latest?.caughtAt) return;
+
+        // Refund any outstanding bets on run-away.
+        await refundBetsForSpawn(spawn.id);
+
         // Only emit if this spawn is still what's shown on the overlay
         if (overlayLastSpawn && overlayLastSpawn.id === spawn.id) {
           overlayBroadcast({ type: "despawn", spawnId: spawn.id });
@@ -345,18 +433,46 @@ async function announceSpawn(spawn) {
 }
 
 async function spawnLoop() {
-  const spawn = await game.ensureSpawnExists();
-  await announceSpawn(spawn);
+  // Ensure a spawn exists at boot (optional). If you want *no* immediate spawn,
+  // set SPAWN_ON_BOOT=0.
+  const spawnOnBoot = String(process.env.SPAWN_ON_BOOT || "1") !== "0";
+  if (spawnOnBoot) {
+    const spawn = await game.ensureSpawnExists();
+    await announceSpawn(spawn);
+  }
 
-  const interval = envInt("SPAWN_INTERVAL_SECONDS", 90) * 1000;
-  setInterval(async () => {
-    try {
-      const s = await game.spawn();
-      await announceSpawn(s);
-    } catch (e) {
-      console.error("Spawn loop error:", e);
-    }
-  }, interval);
+  // Randomized spawn interval (min/max)
+  // Defaults: 60s - 900s (1m - 15m)
+  const minS = envInt("SPAWN_DELAY_MIN_SECONDS", 60);
+  const maxS = envInt("SPAWN_DELAY_MAX_SECONDS", 900);
+  const nextDelayMs = () => {
+    const min = Math.max(5, minS);
+    const max = Math.max(min, maxS);
+    const secs = min + Math.floor(Math.random() * (max - min + 1));
+    return secs * 1000;
+  };
+
+  let timer = null;
+  const schedule = () => {
+    if (timer) clearTimeout(timer);
+    const delay = nextDelayMs();
+    console.log(`[spawn] next spawn in ${Math.round(delay / 1000)}s`);
+    timer = setTimeout(async () => {
+      try {
+        const active = await game.getActiveSpawn();
+        if (!active) {
+          const s = await game.spawn();
+          await announceSpawn(s);
+        }
+      } catch (e) {
+        console.error("Spawn loop error:", e);
+      } finally {
+        schedule();
+      }
+    }, delay);
+  };
+
+  schedule();
 }
 
 // ---------- PKCE helpers (REQUIRED by Kick OAuth 2.1) ----------
@@ -714,6 +830,11 @@ app.post("/admin/spawn", async (req, res) => {
 });
 
 // ---------- Kick chat command handler ----------
+// Per-user anti-spam cooldown for catch attempts
+// (prevents users from spamming !catch)
+const CATCH_COOLDOWN_MS = envInt("CATCH_COOLDOWN_MS", 1500);
+const lastCatchAttemptAt = new Map();
+
 async function handleChat({ username, userId, content }) {
   const msg = String(content || "").trim();
   if (!msg.startsWith(PREFIX)) return;
@@ -722,6 +843,13 @@ async function handleChat({ username, userId, content }) {
 
   // !catch <name>
   if (lower.startsWith(`${PREFIX}catch `)) {
+    // 1.5s cooldown per user (or override via env CATCH_COOLDOWN_MS)
+    const key = userId ? `kick:${String(userId)}` : `kick:${String(username || "").toLowerCase()}`;
+    const now = Date.now();
+    const last = lastCatchAttemptAt.get(key) || 0;
+    if (now - last < CATCH_COOLDOWN_MS) return;
+    lastCatchAttemptAt.set(key, now);
+
     const guess = msg.slice(`${PREFIX}catch `.length);
     const result = await game.tryCatch({
       username,
@@ -763,10 +891,27 @@ async function handleChat({ username, userId, content }) {
     const shinyTag = s.isShiny ? " ✨SHINY✨" : "";
     const lvlTag = s.level ? `Lv. ${s.level} ` : "";
 
+    // Settle bets (if the catcher placed one) and pay out.
+    let betMsg = "";
+    try {
+      const user = result.user;
+      const key = betKey(s.id, user.id);
+      const row = await prisma.setting.findUnique({ where: { key } });
+      const betAmt = Math.max(0, Math.floor(Number(row?.value) || 0));
+      if (betAmt > 0) {
+        const mult = payoutMultiplierForSpawn(s);
+        const payout = Math.max(0, Math.floor(betAmt * mult));
+        betMsg = ` (+${payout} coins from bet)`;
+      }
+      await settleBetsOnCatch(s, user.id);
+    } catch (e) {
+      console.warn("Bet settlement skipped:", e?.message || e);
+    }
+
     try {
       await refreshKickTokenIfNeeded();
       await sendKickChatMessage(
-        `${username} caught ${lvlTag}${s.pokemon}${shinyTag} for ${result.catch.pointsEarned} pts!`
+        `${username} caught ${lvlTag}${s.pokemon}${shinyTag} for ${result.catch.pointsEarned} pts!${betMsg}`
       );
     } catch (e) {
       console.error("sendKickChatMessage failed:", e?.message || e);
@@ -810,6 +955,33 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
+  // !pokelb (Pokémon catches leaderboard)
+  if (lower === `${PREFIX}pokelb` || lower === `${PREFIX}pokemonlb`) {
+    const rows = await prisma.catch.groupBy({
+      by: ["userId"],
+      _count: { _all: true },
+      orderBy: { _count: { _all: "desc" } },
+      take: 10
+    });
+    if (!rows.length) {
+      try {
+        await refreshKickTokenIfNeeded();
+        await sendKickChatMessage("No catches yet.");
+      } catch {}
+      return;
+    }
+    const users = await prisma.user.findMany({ where: { id: { in: rows.map(r => r.userId) } } });
+    const uMap = new Map(users.map(u => [u.id, u]));
+    const line = rows
+      .map((r, i) => `${i + 1}. ${(uMap.get(r.userId)?.displayName || "unknown")}: ${r._count._all}`)
+      .join(" | ");
+    try {
+      await refreshKickTokenIfNeeded();
+      await sendKickChatMessage(`📦 Catch Leaderboard — ${line}`);
+    } catch {}
+    return;
+  }
+
   // !me
   if (lower === `${PREFIX}me`) {
     const stats = await game.userStats(username);
@@ -828,6 +1000,93 @@ async function handleChat({ username, userId, content }) {
     } catch (e) {
       console.error("sendKickChatMessage failed:", e?.message || e);
     }
+    return;
+  }
+
+  // !inventory (recent catches)  /  !inv
+  if (lower === `${PREFIX}inventory` || lower === `${PREFIX}inv`) {
+    const user = await game.getOrCreateKickUser(username, userId);
+    const coins = await getCoins(user.id);
+    const recent = await prisma.catch.findMany({
+      where: { userId: user.id },
+      orderBy: { caughtAt: "desc" },
+      take: 8
+    });
+    if (!recent.length) {
+      try {
+        await refreshKickTokenIfNeeded();
+        await sendKickChatMessage(`${username} — no catches yet. Coins: ${coins}`);
+      } catch {}
+      return;
+    }
+    const list = recent
+      .map((c) => `${c.isShiny ? "✨" : ""}${c.pokemon}${c.level ? " Lv." + c.level : ""}`)
+      .join(", ");
+    try {
+      await refreshKickTokenIfNeeded();
+      await sendKickChatMessage(`🎒 ${username} — Coins: ${coins} | Recent: ${list}`);
+    } catch {}
+    return;
+  }
+
+  // !bet <amount>  (alias: !wager)
+  if (lower.startsWith(`${PREFIX}bet`) || lower.startsWith(`${PREFIX}wager`)) {
+    const parts = msg.trim().split(/\s+/);
+    const sub = (parts[1] || "").toLowerCase();
+
+    // cancel
+    if (sub === "cancel") {
+      const user = await game.getOrCreateKickUser(username, userId);
+      const spawn = await game.getActiveSpawn();
+      if (!spawn) {
+        try { await refreshKickTokenIfNeeded(); await sendKickChatMessage("No active Pokémon."); } catch {}
+        return;
+      }
+      const key = betKey(spawn.id, user.id);
+      const row = await prisma.setting.findUnique({ where: { key } });
+      const amt = Math.max(0, Math.floor(Number(row?.value) || 0));
+      if (!row || amt <= 0) {
+        try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — no active bet to cancel.`); } catch {}
+        return;
+      }
+      await prisma.setting.delete({ where: { key } }).catch(() => {});
+      await addCoins(user.id, amt);
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} canceled the bet and got ${amt} coins back.`); } catch {}
+      return;
+    }
+
+    // place bet
+    const amt = Math.floor(Number(parts[1] || 0));
+    if (!Number.isFinite(amt) || amt <= 0) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`Usage: ${PREFIX}bet <amount> (or ${PREFIX}bet cancel)`); } catch {}
+      return;
+    }
+    const spawn = await game.getActiveSpawn();
+    if (!spawn) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage("No Pokémon active to bet on."); } catch {}
+      return;
+    }
+    const user = await game.getOrCreateKickUser(username, userId);
+    const key = betKey(spawn.id, user.id);
+    const existing = await prisma.setting.findUnique({ where: { key } });
+    if (existing) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — you already placed a bet for this spawn. (${PREFIX}bet cancel)`); } catch {}
+      return;
+    }
+    const coins = await getCoins(user.id);
+    if (amt > coins) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — not enough coins. Balance: ${coins}`); } catch {}
+      return;
+    }
+
+    await setCoins(user.id, coins - amt);
+    await prisma.setting.create({ data: { key, value: String(amt) } });
+
+    const mult = payoutMultiplierForSpawn(spawn);
+    try {
+      await refreshKickTokenIfNeeded();
+      await sendKickChatMessage(`${username} bet ${amt} coins on ${spawn.pokemon}! If you catch it, payout ≈ x${mult.toFixed(2)}.`);
+    } catch {}
     return;
   }
 
