@@ -10,15 +10,37 @@ function randInt(max) {
   return Math.floor(Math.random() * max);
 }
 
+function leaderAdjKey(userId) {
+  return `lp_adj:${userId}`;
+}
+
+async function getLeaderAdj(userId) {
+  const row = await prisma.setting.findUnique({ where: { key: leaderAdjKey(userId) } });
+  if (!row?.value) return 0;
+  const n = Number(row.value);
+  return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+
+
 class Game {
   constructor() {
-    this.spawnIntervalSeconds = envInt("SPAWN_INTERVAL_SECONDS", 90);
+    // Randomized spawn pacing is controlled by the server scheduler.
+    // These defaults are also exposed for convenience.
+    this.spawnDelayMinSeconds = envInt("SPAWN_DELAY_MIN_SECONDS", 60); // 1 minute
+    this.spawnDelayMaxSeconds = envInt("SPAWN_DELAY_MAX_SECONDS", 900); // 15 minutes
     this.despawnSeconds = envInt("DESPAWN_SECONDS", 45);
     this.shinyOdds = envInt("SHINY_ODDS", 512);
 
     // optional tuning
     this.levelMin = envInt("LEVEL_MIN", 3);
     this.levelMax = envInt("LEVEL_MAX", 75);
+  }
+
+  nextSpawnDelayMs() {
+    const min = Math.max(5, this.spawnDelayMinSeconds);
+    const max = Math.max(min, this.spawnDelayMaxSeconds);
+    const secs = min + Math.floor(Math.random() * (max - min + 1));
+    return secs * 1000;
   }
 
   async getOrCreateKickUser(username, platformUserId = null) {
@@ -131,10 +153,12 @@ class Game {
     if (!spawn) return { ok: false, reason: "no_spawn" };
 
     const guess = String(guessName || "").trim().toLowerCase();
-    if (!guess) return { ok: false, reason: "no_guess" };
 
-    if (guess !== String(spawn.pokemon || "").toLowerCase()) {
-      return { ok: false, reason: "wrong_name" };
+    // If a name was provided, enforce it. If not, allow plain !catch (only one spawn exists at a time).
+    if (guess) {
+      if (guess !== String(spawn.pokemon || "").toLowerCase()) {
+        return { ok: false, reason: "wrong_name" };
+      }
     }
 
     // Level-based catch difficulty
@@ -218,38 +242,20 @@ class Game {
 
     const userMap = new Map(users.map((u) => [u.id, u]));
 
+    const keys = rows.map((r) => leaderAdjKey(r.userId));
+
+    const adjRows = await prisma.setting.findMany({ where: { key: { in: keys } } });
+    const adjMap = new Map(adjRows.map((x) => [x.key, Math.trunc(Number(x.value) || 0)]));
+
     return rows.map((r, i) => ({
       rank: i + 1,
       userId: r.userId,
       name: userMap.get(r.userId)?.displayName || "unknown",
-      points: r._sum.pointsEarned || 0
+      points: (r._sum.pointsEarned || 0) + (adjMap.get(leaderAdjKey(r.userId)) || 0)
     }));
   }
 
-  
-  async leaderboardSince(sinceDate, limit = 10) {
-    const since = sinceDate instanceof Date ? sinceDate : new Date(sinceDate);
-    const rows = await prisma.catch.groupBy({
-      by: ["userId"],
-      where: { caughtAt: { gte: since } },
-      _sum: { pointsEarned: true },
-      orderBy: { _sum: { pointsEarned: "desc" } },
-      take: limit
-    });
-
-    const users = await prisma.user.findMany({
-      where: { id: { in: rows.map((r) => r.userId) } }
-    });
-    const userMap = new Map(users.map((u) => [u.id, u]));
-    return rows.map((r, i) => ({
-      rank: i + 1,
-      userId: r.userId,
-      name: userMap.get(r.userId)?.displayName || "unknown",
-      points: r._sum.pointsEarned || 0
-    }));
-  }
-
-async userStats(username) {
+  async userStats(username) {
     const handle = String(username || "").toLowerCase();
     const ident = await prisma.userIdentity.findUnique({
       where: { platform_handle: { platform: "kick", handle } },
@@ -265,7 +271,7 @@ async userStats(username) {
 
     return {
       name: ident.user.displayName || username,
-      points: totalPoints._sum.pointsEarned || 0,
+      points: (totalPoints._sum.pointsEarned || 0) + (await getLeaderAdj(ident.user.id)),
       catches: totalCatches,
       shinies: totalShinies
     };
