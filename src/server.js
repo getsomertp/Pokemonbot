@@ -78,9 +78,38 @@ process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
 
 // ---------- DB bootstrap ----------
 function ensureDbSchema() {
-  console.log("Running: npx prisma db push");
-  execSync("npx prisma db push", { stdio: "inherit" });
-  console.log("✅ prisma db push complete");
+  // Production-safe: apply committed migrations (no destructive db-push guessing)
+  // If there are no migrations yet, don't hard-fail the service; continue booting.
+  const cmd = "npx prisma migrate deploy";
+  console.log(`Running: ${cmd}`);
+  try {
+    const out = execSync(cmd, { encoding: "utf8" });
+    if (out) process.stdout.write(out);
+    console.log("✅ prisma migrate deploy complete");
+  } catch (e) {
+    const stdout = e?.stdout ? e.stdout.toString() : "";
+    const stderr = e?.stderr ? e.stderr.toString() : "";
+    if (stdout) process.stdout.write(stdout);
+    if (stderr) process.stderr.write(stderr);
+
+    const msg = `${stdout}\n${stderr}\n${e?.message || ""}`;
+
+    // If no migrations exist (common for first deploy), don't crash the whole service.
+    // Prisma error text can vary a bit by version.
+    const noMigrations =
+      msg.includes("No migrations found") ||
+      msg.includes("No migration found") ||
+      msg.includes("Could not find any migrations") ||
+      msg.includes("Could not find a migrations directory") ||
+      msg.includes("migrations directory") && msg.includes("not found");
+
+    if (noMigrations) {
+      console.warn("⚠️ No Prisma migrations to deploy yet; continuing without applying migrations.");
+      return;
+    }
+
+    throw e;
+  }
 }
 
 // ---------- Kick OAuth token auto-refresh ----------
