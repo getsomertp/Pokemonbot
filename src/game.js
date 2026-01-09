@@ -10,6 +10,18 @@ function randInt(max) {
   return Math.floor(Math.random() * max);
 }
 
+function leaderAdjKey(userId) {
+  return `lp_adj:${userId}`;
+}
+
+async function getLeaderAdj(userId) {
+  const row = await prisma.setting.findUnique({ where: { key: leaderAdjKey(userId) } });
+  if (!row?.value) return 0;
+  const n = Number(row.value);
+  return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+
+
 class Game {
   constructor() {
     // Randomized spawn pacing is controlled by the server scheduler.
@@ -141,10 +153,12 @@ class Game {
     if (!spawn) return { ok: false, reason: "no_spawn" };
 
     const guess = String(guessName || "").trim().toLowerCase();
-    if (!guess) return { ok: false, reason: "no_guess" };
 
-    if (guess !== String(spawn.pokemon || "").toLowerCase()) {
-      return { ok: false, reason: "wrong_name" };
+    // If a name was provided, enforce it. If not, allow plain !catch (only one spawn exists at a time).
+    if (guess) {
+      if (guess !== String(spawn.pokemon || "").toLowerCase()) {
+        return { ok: false, reason: "wrong_name" };
+      }
     }
 
     // Level-based catch difficulty
@@ -228,11 +242,16 @@ class Game {
 
     const userMap = new Map(users.map((u) => [u.id, u]));
 
+    const keys = rows.map((r) => leaderAdjKey(r.userId));
+
+    const adjRows = await prisma.setting.findMany({ where: { key: { in: keys } } });
+    const adjMap = new Map(adjRows.map((x) => [x.key, Math.trunc(Number(x.value) || 0)]));
+
     return rows.map((r, i) => ({
       rank: i + 1,
       userId: r.userId,
       name: userMap.get(r.userId)?.displayName || "unknown",
-      points: r._sum.pointsEarned || 0
+      points: (r._sum.pointsEarned || 0) + (adjMap.get(leaderAdjKey(r.userId)) || 0)
     }));
   }
 
@@ -252,7 +271,7 @@ class Game {
 
     return {
       name: ident.user.displayName || username,
-      points: totalPoints._sum.pointsEarned || 0,
+      points: (totalPoints._sum.pointsEarned || 0) + (await getLeaderAdj(ident.user.id)),
       catches: totalCatches,
       shinies: totalShinies
     };

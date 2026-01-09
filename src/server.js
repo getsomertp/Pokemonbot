@@ -91,42 +91,45 @@ async function setSoundSettings(streamer, { enabled, volume }) {
   return cur;
 }
 
-// ---- Economy (coins) + Betting ----
-// Uses the Setting table for simplicity (no new migrations required).
+// ---- Economy (leaderpoints) + Betting ----
+// Wagering uses the SAME currency as the leaderboard: pointsEarned ("leaderpoints").
+// We can't subtract from Catch rows (they are history), so we store a per-user adjustment
+// in the Setting table and include it in totals.
 // Keys:
-//  - coins:<userId> => number
-//  - bet:<spawnId>:<userId> => wager amount
+//  - lp_adj:<userId> => signed integer adjustment added to sum(pointsEarned)
 
-function coinsKey(userId) {
-  return `coins:${userId}`;
+function lpAdjKey(userId) {
+  return `lp_adj:${userId}`;
 }
 
-function betKey(spawnId, userId) {
-  return `bet:${spawnId}:${userId}`;
-}
-
-async function getCoins(userId) {
-  const row = await prisma.setting.findUnique({ where: { key: coinsKey(userId) } });
-  if (!row?.value) return envInt("STARTING_COINS", 1000);
+async function getLpAdj(userId) {
+  const row = await prisma.setting.findUnique({ where: { key: lpAdjKey(userId) } });
+  if (!row?.value) return 0;
   const n = Number(row.value);
-  return Number.isFinite(n) ? n : envInt("STARTING_COINS", 1000);
+  return Number.isFinite(n) ? Math.trunc(n) : 0;
 }
 
-async function setCoins(userId, amount) {
-  const n = Math.max(0, Math.floor(Number(amount) || 0));
+async function setLpAdj(userId, amount) {
+  const n = Math.trunc(Number(amount) || 0);
   await prisma.setting.upsert({
-    where: { key: coinsKey(userId) },
+    where: { key: lpAdjKey(userId) },
     update: { value: String(n) },
-    create: { key: coinsKey(userId), value: String(n) }
+    create: { key: lpAdjKey(userId), value: String(n) }
   });
   return n;
 }
 
-async function addCoins(userId, delta) {
-  const cur = await getCoins(userId);
-  return setCoins(userId, cur + (Number(delta) || 0));
+async function addLpAdj(userId, delta) {
+  const cur = await getLpAdj(userId);
+  return setLpAdj(userId, cur + (Math.trunc(Number(delta) || 0)));
 }
 
+async function getLeaderPoints(userId) {
+  const agg = await prisma.catch.aggregate({ where: { userId }, _sum: { pointsEarned: true } });
+  const base = agg?._sum?.pointsEarned || 0;
+  const adj = await getLpAdj(userId);
+  return base + adj;
+}
 function payoutMultiplierForSpawn(spawn) {
   // Tune to taste via env vars later.
   const tier = String(spawn?.tier || "common").toLowerCase();
@@ -142,35 +145,6 @@ function payoutMultiplierForSpawn(spawn) {
   return base * shinyMult;
 }
 
-async function refundBetsForSpawn(spawnId) {
-  const bets = await prisma.setting.findMany({ where: { key: { startsWith: `bet:${spawnId}:` } } });
-  for (const b of bets) {
-    const parts = String(b.key).split(":");
-    const userId = parts[2];
-    const amt = Math.max(0, Math.floor(Number(b.value) || 0));
-    if (userId && amt > 0) {
-      await addCoins(userId, amt);
-    }
-    await prisma.setting.delete({ where: { key: b.key } }).catch(() => {});
-  }
-}
-
-async function settleBetsOnCatch(spawn, catcherUserId) {
-  const bets = await prisma.setting.findMany({ where: { key: { startsWith: `bet:${spawn.id}:` } } });
-  if (!bets.length) return;
-
-  const mult = payoutMultiplierForSpawn(spawn);
-  for (const b of bets) {
-    const parts = String(b.key).split(":");
-    const userId = parts[2];
-    const amt = Math.max(0, Math.floor(Number(b.value) || 0));
-    if (userId && amt > 0 && userId === catcherUserId) {
-      const payout = Math.max(0, Math.floor(amt * mult));
-      await addCoins(userId, payout);
-    }
-    await prisma.setting.delete({ where: { key: b.key } }).catch(() => {});
-  }
-}
 
 function spriteUrlForSpawn(spawn) {
   try {
@@ -390,7 +364,7 @@ function spawnLabel(spawn) {
 }
 
 async function announceSpawn(spawn) {
-  const msg = `A wild ${spawnLabel(spawn)} appeared! Type ${PREFIX}catch ${spawn.pokemon}`;
+  const msg = `A wild ${spawnLabel(spawn)} appeared! Type ${PREFIX}catch`;
 
   // Push to OBS overlay
   overlayLastSpawn = spawn;
@@ -405,13 +379,6 @@ async function announceSpawn(spawn) {
         const active = await game.getActiveSpawn();
         const stillActiveSame = active && active.id === spawn.id;
         if (stillActiveSame) return;
-
-        // If it was caught, do not refund bets here (they are settled on catch).
-        const latest = await prisma.spawn.findUnique({ where: { id: spawn.id } }).catch(() => null);
-        if (latest?.caughtAt) return;
-
-        // Refund any outstanding bets on run-away.
-        await refundBetsForSpawn(spawn.id);
 
         // Only emit if this spawn is still what's shown on the overlay
         if (overlayLastSpawn && overlayLastSpawn.id === spawn.id) {
@@ -655,161 +622,182 @@ app.get("/state", async (req, res) => {
 // ---------- OBS Overlay ----------
 app.get("/overlay", (req, res) => {
   const showUi = String(req.query.ui || "") === "1";
-  const html = [
-    '<!doctype html>',
-    '<html>',
-    '<head>',
-    '<meta charset="utf-8"/>',
-    '<meta name="viewport" content="width=device-width, initial-scale=1"/>',
-    '<title>Pokemon Overlay</title>',
-    '<style>',
-    '  body{margin:0; background:transparent; overflow:hidden;}',
-    '  #wrap{position:relative; width:100vw; height:100vh;}',
-    '  #card{position:absolute; left:40px; top:40px; display:none; align-items:center; gap:18px; padding:14px 18px; border-radius:18px; background:rgba(0,0,0,0.55); backdrop-filter:blur(6px); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}',
-    '  #sprite{width:140px; height:140px; image-rendering:pixelated;}',
-    '  #name{font-size:28px; font-weight:800; line-height:1.1;}',
-    '  #meta{opacity:0.9; font-size:18px;}',
-    '  .shiny{filter: drop-shadow(0 0 18px rgba(255,255,255,0.9)); animation: shimmer 1.2s ease-in-out infinite;}',
-    '  @keyframes shimmer{0%{filter: drop-shadow(0 0 10px rgba(255,255,255,0.45));} 50%{filter: drop-shadow(0 0 24px rgba(255,255,255,0.95));} 100%{filter: drop-shadow(0 0 10px rgba(255,255,255,0.45));}}',
-    '  .pop{animation: pop 300ms ease-out;}',
-    '  @keyframes pop{from{transform:scale(0.85); opacity:0;} to{transform:scale(1); opacity:1;}}',
-    '  #barWrap{margin-top:10px; width:260px; height:10px; background:rgba(255,255,255,0.20); border-radius:999px; overflow:hidden;}',
-    '  #bar{width:100%; height:100%; background:rgba(255,255,255,0.85); transform-origin:left center;}',
-    '  #toast{position:absolute; left:40px; top:210px; display:none; padding:10px 14px; border-radius:14px; background:rgba(0,0,0,0.60); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:20px;}',
-    '  #toast.show{display:block; animation: toast 1400ms ease-out both;}',
-    '  @keyframes toast{0%{transform:translateY(-6px); opacity:0;} 12%{transform:translateY(0); opacity:1;} 80%{opacity:1;} 100%{transform:translateY(6px); opacity:0;}}',
-    showUi ? '  #ui{position:absolute; right:20px; bottom:20px; background:rgba(0,0,0,0.5); color:white; padding:12px; border-radius:12px; font-family:system-ui;}' : '  #ui{display:none;}',
-    '</style>',
-    '</head>',
-    '<body>',
-    '<div id="wrap">',
-    '  <div id="card">',
-    '    <img id="sprite"/>',
-    '    <div>',
-    '      <div id="name"></div>',
-    '      <div id="meta"></div>',
-    '      <div id="barWrap"><div id="bar"></div></div>',
-    '    </div>',
-    '  </div>',
-    '  <div id="toast"></div>',
-    `  <div id="ui"><div><b>Sound</b>: <span id="uiEnabled">?</span></div><div>Vol: <span id="uiVol">?</span></div><input id="uiSlider" type="range" min="0" max="100" value="50" style="width:220px"/></div>`,
-    '  <audio id="loop" src="/sounds/wild_battle.mp3" loop preload="auto"></audio>',
-    '</div>',
-    '<script>',
-    '  const card = document.getElementById("card");',
-    '  const sprite = document.getElementById("sprite");',
-    '  const nameEl = document.getElementById("name");',
-    '  const metaEl = document.getElementById("meta");',
-    '  const bar = document.getElementById("bar");',
-    '  const toast = document.getElementById("toast");',
-    '  const audioEl = document.getElementById("loop");',
-    '  const uiEnabled = document.getElementById("uiEnabled");',
-    '  const uiVol = document.getElementById("uiVol");',
-    '  const uiSlider = document.getElementById("uiSlider");',
-    '  let currentSpawn = null;',
-    '  let hideT = null;',
-    '  let soundEnabled = true;',
-    '  let targetVolume = 0.5;',
-    '  // WebAudio for smooth fade-out',
-    '  let ctx = null, src = null, gain = null;',
-    '  function ensureAudioGraph(){',
-    '    if(ctx) return;',
-    '    try{',
-    '      ctx = new (window.AudioContext || window.webkitAudioContext)();',
-    '      src = ctx.createMediaElementSource(audioEl);',
-    '      gain = ctx.createGain();',
-    '      gain.gain.value = targetVolume;',
-    '      src.connect(gain).connect(ctx.destination);',
-    '    }catch(e){ ctx=null; }',
-    '  }',
-    '  function setVol(v){',
-    '    targetVolume = Math.max(0, Math.min(1, v));',
-    '    if(gain){ try{ gain.gain.setValueAtTime(targetVolume, ctx.currentTime); }catch{} }',
-    '    audioEl.volume = targetVolume;',
-    '    if(uiVol) uiVol.textContent = Math.round(targetVolume*100)+"%";',
-    '    if(uiSlider && document.getElementById("ui").style.display!=="none") uiSlider.value = String(Math.round(targetVolume*100));',
-    '  }',
-    '  function setEnabled(en){',
-    '    soundEnabled = !!en;',
-    '    if(uiEnabled) uiEnabled.textContent = soundEnabled ? "ON" : "OFF";',
-    '    if(!soundEnabled) fadeOutAndStop(150);',
-    '    else if(currentSpawn) startLoop();',
-    '  }',
-    '  async function startLoop(){',
-    '    if(!soundEnabled) return;',
-    '    try{ ensureAudioGraph(); if(ctx && ctx.state==="suspended") await ctx.resume(); }catch{}',
-    '    try{',
-    '      audioEl.currentTime = 0;',
-    '      audioEl.volume = targetVolume;',
-    '      if(gain && ctx){ gain.gain.cancelScheduledValues(ctx.currentTime); gain.gain.setValueAtTime(targetVolume, ctx.currentTime); }',
-    '      await audioEl.play();',
-    '    }catch(e){}',
-    '  }',
-    '  function fadeOutAndStop(ms){',
-    '    try{',
-    '      if(gain && ctx){',
-    '        const t = ctx.currentTime;',
-    '        gain.gain.cancelScheduledValues(t);',
-    '        gain.gain.setValueAtTime(gain.gain.value, t);',
-    '        gain.gain.linearRampToValueAtTime(0.0001, t + (ms/1000));',
-    '        setTimeout(()=>{ try{ audioEl.pause(); audioEl.currentTime = 0; gain.gain.setValueAtTime(targetVolume, ctx.currentTime);}catch{} }, ms+40);',
-    '      } else {',
-    '        // fallback: step volume down',
-    '        const start = audioEl.volume; const steps = 10; let i=0;',
-    '        const int = setInterval(()=>{ i++; audioEl.volume = Math.max(0, start*(1-i/steps)); if(i>=steps){ clearInterval(int); audioEl.pause(); audioEl.currentTime=0; audioEl.volume=targetVolume;} }, Math.max(16, Math.floor(ms/steps)));',
-    '      }',
-    '    }catch(e){ try{ audioEl.pause(); audioEl.currentTime=0; }catch{} }',
-    '  }',
-    '  function show(spawn){',
-    '    if(!spawn || !spawn.sprite) return;',
-    '    currentSpawn = spawn;',
-    '    sprite.src = spawn.sprite;',
-    '    sprite.className = spawn.isShiny ? "shiny" : "";',
-    '    nameEl.textContent = (spawn.isShiny ? "✨ " : "") + spawn.name;',
-    '    metaEl.textContent = `Lv. ${spawn.level} • ${spawn.tier}`;',
-    '    card.style.display = "flex";',
-    '    card.classList.remove("pop"); void card.offsetWidth; card.classList.add("pop");',
-    '    if(hideT) clearTimeout(hideT);',
-    '    // Keep the card visible while capturable; hide on clear/caught/despawn',
-    '    hideT = null;',
-    '    startLoop();',
-    '  }',
-    '  function clear(){ currentSpawn=null; card.style.display = "none"; fadeOutAndStop(650); }',
-    '  function caught(trainer, pokemon, isShiny){',
-    '    toast.textContent = `🎮 ${trainer} caught ${isShiny ? "✨ " : ""}${pokemon}!`;',
-    '    toast.classList.remove("show"); void toast.offsetWidth; toast.classList.add("show");',
-    '    clear();',
-    '  }',
-    '  function despawn(){ clear(); }',
-    '  function tickBar(){',
-    '    try{',
-    '      if(!currentSpawn || !currentSpawn.spawnedAt || !currentSpawn.expiresAt){ requestAnimationFrame(tickBar); return; }',
-    '      const start = new Date(currentSpawn.spawnedAt).getTime();',
-    '      const end = new Date(currentSpawn.expiresAt).getTime();',
-    '      const now = Date.now();',
-    '      const pct = Math.max(0, Math.min(1, (end-now)/(end-start)));',
-    '      bar.style.transform = `scaleX(${pct})`;',
-    '      requestAnimationFrame(tickBar);',
-    '    }catch(e){ requestAnimationFrame(tickBar); }',
-    '  }',
-    '  tickBar();',
-    '  // Optional UI slider (if ?ui=1)',
-    '  if(uiSlider){ uiSlider.oninput = ()=>{ setVol(Number(uiSlider.value)/100); }; }',
-    '  const proto = location.protocol === "https:" ? "wss" : "ws";',
-    '  const ws = new WebSocket(`${proto}://${location.host}/overlay/ws`);',
-    '  ws.onmessage = (e)=>{',
-    '    try{',
-    '      const msg = JSON.parse(e.data);',
-    '      if(msg.type === "spawn") show(msg.spawn);',
-    '      if(msg.type === "clear") clear();',
-    '      if(msg.type === "despawn") despawn();',
-    '      if(msg.type === "caught") caught(msg.trainer || "Someone", msg.pokemon || "a Pokémon", !!msg.isShiny);',
-    '      if(msg.type === "sound_settings" && msg.settings){ setEnabled(msg.settings.enabled); setVol(msg.settings.volume); }',
-    '    }catch{}',
-    '  };',
-    '</script>',
-    '</body></html>'
-  ].join("\n");
+  const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Pokemon Overlay</title>
+  <style>
+    html,body{margin:0; padding:0; width:450px; height:450px; background:transparent; overflow:hidden;}
+    #wrap{position:relative; width:450px; height:450px;}
+    #card{position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); display:none; align-items:center; gap:18px; padding:14px 18px; border-radius:18px; background:rgba(0,0,0,0.55); backdrop-filter:blur(6px); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+    #sprite{width:160px; height:160px; image-rendering:pixelated;}
+    #name{font-size:28px; font-weight:800; line-height:1.1; white-space:nowrap; max-width:240px; overflow:hidden; text-overflow:ellipsis;}
+    #meta{opacity:0.9; font-size:18px;}
+    .shiny{filter: drop-shadow(0 0 18px rgba(255,255,255,0.9)); animation: shimmer 1.2s ease-in-out infinite;}
+    @keyframes shimmer{0%{filter: drop-shadow(0 0 10px rgba(255,255,255,0.45));} 50%{filter: drop-shadow(0 0 24px rgba(255,255,255,0.95));} 100%{filter: drop-shadow(0 0 10px rgba(255,255,255,0.45));}}
+    .pop{animation: pop 300ms ease-out;}
+    @keyframes pop{from{transform:translate(-50%,-50%) scale(0.85); opacity:0;} to{transform:translate(-50%,-50%) scale(1); opacity:1;}}
+    #barWrap{margin-top:10px; width:260px; height:10px; background:rgba(255,255,255,0.20); border-radius:999px; overflow:hidden;}
+    #bar{width:100%; height:100%; background:rgba(255,255,255,0.85); transform-origin:left center;}
+    #toast{position:absolute; left:50%; top:calc(50% + 125px); transform:translateX(-50%); display:none; padding:10px 14px; border-radius:14px; background:rgba(0,0,0,0.60); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:20px; white-space:nowrap;}
+    #toast.show{display:block; animation: toast 1400ms ease-out both;}
+    @keyframes toast{0%{transform:translate(-50%,-6px); opacity:0;} 12%{transform:translate(-50%,0); opacity:1;} 80%{opacity:1;} 100%{transform:translate(-50%,6px); opacity:0;}}
+    #unlock{position:absolute; left:50%; top:16px; transform:translateX(-50%); display:none; padding:10px 14px; border-radius:12px; border:0; background:rgba(0,0,0,0.65); color:white; font-family:system-ui; font-size:14px; cursor:pointer;}
+    ${showUi ? '#ui{position:absolute; right:16px; bottom:16px; background:rgba(0,0,0,0.5); color:white; padding:12px; border-radius:12px; font-family:system-ui;}' : '#ui{display:none;}'}
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="card">
+      <img id="sprite"/>
+      <div>
+        <div id="name"></div>
+        <div id="meta"></div>
+        <div id="barWrap"><div id="bar"></div></div>
+      </div>
+    </div>
+    <div id="toast"></div>
+    <button id="unlock">Click to enable battle sound</button>
+    <div id="ui">
+      <div><b>Sound</b>: <span id="uiEnabled">?</span></div>
+      <div>Vol: <span id="uiVol">?</span></div>
+      <input id="uiSlider" type="range" min="0" max="100" value="50" style="width:220px"/>
+    </div>
+    <audio id="loop" src="/sounds/wild_battle.mp3" loop preload="auto"></audio>
+  </div>
+
+  <script>
+    const card = document.getElementById("card");
+    const sprite = document.getElementById("sprite");
+    const nameEl = document.getElementById("name");
+    const metaEl = document.getElementById("meta");
+    const bar = document.getElementById("bar");
+    const toast = document.getElementById("toast");
+    const unlockBtn = document.getElementById("unlock");
+    const audioEl = document.getElementById("loop");
+    const uiEnabled = document.getElementById("uiEnabled");
+    const uiVol = document.getElementById("uiVol");
+    const uiSlider = document.getElementById("uiSlider");
+
+    let currentSpawn = null;
+    let soundEnabled = true;
+    let targetVolume = 0.5;
+
+    // WebAudio for smooth fade-out
+    let ctx = null, src = null, gain = null;
+    function ensureAudioGraph(){
+      if(ctx) return;
+      try{
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        src = ctx.createMediaElementSource(audioEl);
+        gain = ctx.createGain();
+        gain.gain.value = targetVolume;
+        src.connect(gain).connect(ctx.destination);
+      }catch(e){ ctx=null; }
+    }
+
+    function setVol(v){
+      targetVolume = Math.max(0, Math.min(1, v));
+      if(gain && ctx){ try{ gain.gain.setValueAtTime(targetVolume, ctx.currentTime); }catch{} }
+      audioEl.volume = targetVolume;
+      if(uiVol) uiVol.textContent = Math.round(targetVolume*100)+"%";
+      if(uiSlider && document.getElementById("ui").style.display!=="none") uiSlider.value = String(Math.round(targetVolume*100));
+    }
+
+    function setEnabled(en){
+      soundEnabled = !!en;
+      if(uiEnabled) uiEnabled.textContent = soundEnabled ? "ON" : "OFF";
+      if(!soundEnabled) fadeOutAndStop(150);
+      else if(currentSpawn) startLoop();
+    }
+
+    async function startLoop(){
+      if(!soundEnabled) return;
+      try{ ensureAudioGraph(); if(ctx && ctx.state==="suspended") await ctx.resume(); }catch{}
+      try{
+        audioEl.currentTime = 0;
+        audioEl.volume = targetVolume;
+        if(gain && ctx){ gain.gain.cancelScheduledValues(ctx.currentTime); gain.gain.setValueAtTime(targetVolume, ctx.currentTime); }
+        await audioEl.play();
+        if(unlockBtn) unlockBtn.style.display = "none";
+      }catch(e){
+        if(unlockBtn) unlockBtn.style.display = "block";
+      }
+    }
+
+    function fadeOutAndStop(ms){
+      try{
+        if(gain && ctx){
+          const t = ctx.currentTime;
+          gain.gain.cancelScheduledValues(t);
+          gain.gain.setValueAtTime(gain.gain.value, t);
+          gain.gain.linearRampToValueAtTime(0.0001, t + (ms/1000));
+          setTimeout(()=>{ try{ audioEl.pause(); audioEl.currentTime = 0; gain.gain.setValueAtTime(targetVolume, ctx.currentTime);}catch{} }, ms+40);
+        } else {
+          const start = audioEl.volume; const steps = 10; let i=0;
+          const int = setInterval(()=>{ i++; audioEl.volume = Math.max(0, start*(1-i/steps)); if(i>=steps){ clearInterval(int); audioEl.pause(); audioEl.currentTime=0; audioEl.volume=targetVolume;} }, Math.max(16, Math.floor(ms/steps)));
+        }
+      }catch(e){ try{ audioEl.pause(); audioEl.currentTime=0; }catch{} }
+    }
+
+    function show(spawn){
+      if(!spawn || !spawn.sprite) return;
+      currentSpawn = spawn;
+      sprite.src = spawn.sprite;
+      sprite.className = spawn.isShiny ? "shiny" : "";
+      nameEl.textContent = (spawn.isShiny ? "✨ " : "") + spawn.name;
+      metaEl.textContent = 'Lv. ' + spawn.level + ' • ' + spawn.tier;
+      card.style.display = "flex";
+      card.classList.remove("pop"); void card.offsetWidth; card.classList.add("pop");
+      startLoop();
+    }
+
+    function clear(){ currentSpawn=null; card.style.display = "none"; if(unlockBtn) unlockBtn.style.display="none"; fadeOutAndStop(650); }
+    function caught(trainer, pokemon, isShiny){ toast.textContent = '🎮 ' + trainer + ' caught ' + (isShiny ? '✨ ' : '') + pokemon + '!'; toast.classList.remove("show"); void toast.offsetWidth; toast.classList.add("show"); clear(); }
+    function despawn(){ clear(); }
+
+    function tickBar(){
+      try{
+        if(!currentSpawn || !currentSpawn.spawnedAt || !currentSpawn.expiresAt){ requestAnimationFrame(tickBar); return; }
+        const start = new Date(currentSpawn.spawnedAt).getTime();
+        const end = new Date(currentSpawn.expiresAt).getTime();
+        const now = Date.now();
+        const pct = Math.max(0, Math.min(1, (end-now)/(end-start)));
+        bar.style.transform = 'scaleX(' + pct + ')';
+        requestAnimationFrame(tickBar);
+      }catch(e){ requestAnimationFrame(tickBar); }
+    }
+    tickBar();
+
+    // unlock audio via click
+    if(unlockBtn){
+      unlockBtn.addEventListener("click", async ()=>{
+        try{ ensureAudioGraph(); if(ctx && ctx.state==="suspended") await ctx.resume(); }catch{}
+        startLoop();
+      });
+    }
+
+    // Optional UI slider (if ?ui=1)
+    if(uiSlider){ uiSlider.oninput = ()=>{ setVol(Number(uiSlider.value)/100); }; }
+
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(proto + '://' + location.host + '/overlay/ws');
+    ws.onmessage = (e)=>{
+      try{
+        const msg = JSON.parse(e.data);
+        if(msg.type === "spawn") show(msg.spawn);
+        if(msg.type === "clear") clear();
+        if(msg.type === "despawn") despawn();
+        if(msg.type === "caught") caught(msg.trainer || "Someone", msg.pokemon || "a Pokémon", !!msg.isShiny);
+        if(msg.type === "sound_settings" && msg.settings){ setEnabled(msg.settings.enabled); setVol(msg.settings.volume); }
+      }catch{}
+    };
+  </script>
+</body>
+</html>`;
+
   res.status(200).type("html").send(html);
 });
 
@@ -840,9 +828,8 @@ async function handleChat({ username, userId, content }) {
   if (!msg.startsWith(PREFIX)) return;
 
   const lower = msg.toLowerCase();
-
-  // !catch <name>
-  if (lower.startsWith(`${PREFIX}catch `)) {
+  // !catch  (optional: !catch <name>)
+  if (lower === `${PREFIX}catch` || lower.startsWith(`${PREFIX}catch `)) {
     // 1.5s cooldown per user (or override via env CATCH_COOLDOWN_MS)
     const key = userId ? `kick:${String(userId)}` : `kick:${String(username || "").toLowerCase()}`;
     const now = Date.now();
@@ -850,7 +837,7 @@ async function handleChat({ username, userId, content }) {
     if (now - last < CATCH_COOLDOWN_MS) return;
     lastCatchAttemptAt.set(key, now);
 
-    const guess = msg.slice(`${PREFIX}catch `.length);
+    const guess = lower === `${PREFIX}catch` ? "" : msg.slice(`${PREFIX}catch `.length);
     const result = await game.tryCatch({
       username,
       platformUserId: userId,
@@ -858,6 +845,7 @@ async function handleChat({ username, userId, content }) {
     });
 
     if (!result.ok) {
+      // Wrong name: stay silent to avoid chat spam
       if (result.reason === "wrong_name") return;
 
       if (result.reason === "no_spawn") {
@@ -870,7 +858,7 @@ async function handleChat({ username, userId, content }) {
 
       if (result.reason === "already_caught") return;
 
-      // NEW: catch failed (correct name but it broke free)
+      // Catch failed (broke free)
       if (result.reason === "catch_failed") {
         const pct = typeof result.chance === "number" ? Math.round(result.chance * 100) : null;
         try {
@@ -891,27 +879,10 @@ async function handleChat({ username, userId, content }) {
     const shinyTag = s.isShiny ? " ✨SHINY✨" : "";
     const lvlTag = s.level ? `Lv. ${s.level} ` : "";
 
-    // Settle bets (if the catcher placed one) and pay out.
-    let betMsg = "";
-    try {
-      const user = result.user;
-      const key = betKey(s.id, user.id);
-      const row = await prisma.setting.findUnique({ where: { key } });
-      const betAmt = Math.max(0, Math.floor(Number(row?.value) || 0));
-      if (betAmt > 0) {
-        const mult = payoutMultiplierForSpawn(s);
-        const payout = Math.max(0, Math.floor(betAmt * mult));
-        betMsg = ` (+${payout} coins from bet)`;
-      }
-      await settleBetsOnCatch(s, user.id);
-    } catch (e) {
-      console.warn("Bet settlement skipped:", e?.message || e);
-    }
-
     try {
       await refreshKickTokenIfNeeded();
       await sendKickChatMessage(
-        `${username} caught ${lvlTag}${s.pokemon}${shinyTag} for ${result.catch.pointsEarned} pts!${betMsg}`
+        `${username} caught ${lvlTag}${s.pokemon}${shinyTag} for ${result.catch.pointsEarned} pts!`
       );
     } catch (e) {
       console.error("sendKickChatMessage failed:", e?.message || e);
@@ -1006,7 +977,7 @@ async function handleChat({ username, userId, content }) {
   // !inventory (recent catches)  /  !inv
   if (lower === `${PREFIX}inventory` || lower === `${PREFIX}inv`) {
     const user = await game.getOrCreateKickUser(username, userId);
-    const coins = await getCoins(user.id);
+    const leaderPts = await getLeaderPoints(user.id);
     const recent = await prisma.catch.findMany({
       where: { userId: user.id },
       orderBy: { caughtAt: "desc" },
@@ -1015,7 +986,7 @@ async function handleChat({ username, userId, content }) {
     if (!recent.length) {
       try {
         await refreshKickTokenIfNeeded();
-        await sendKickChatMessage(`${username} — no catches yet. Coins: ${coins}`);
+        await sendKickChatMessage(`${username} — no catches yet. LeaderPts: ${leaderPts}`);
       } catch {}
       return;
     }
@@ -1024,69 +995,106 @@ async function handleChat({ username, userId, content }) {
       .join(", ");
     try {
       await refreshKickTokenIfNeeded();
-      await sendKickChatMessage(`🎒 ${username} — Coins: ${coins} | Recent: ${list}`);
+      await sendKickChatMessage(`🎒 ${username} — LeaderPts: ${leaderPts} | Recent: ${list}`);
     } catch {}
     return;
   }
 
   // !bet <amount>  (alias: !wager)
+  // Instant wager: deduct leaderpoints, then immediately attempt to catch the current spawn.
   if (lower.startsWith(`${PREFIX}bet`) || lower.startsWith(`${PREFIX}wager`)) {
     const parts = msg.trim().split(/\s+/);
-    const sub = (parts[1] || "").toLowerCase();
-
-    // cancel
-    if (sub === "cancel") {
-      const user = await game.getOrCreateKickUser(username, userId);
-      const spawn = await game.getActiveSpawn();
-      if (!spawn) {
-        try { await refreshKickTokenIfNeeded(); await sendKickChatMessage("No active Pokémon."); } catch {}
-        return;
-      }
-      const key = betKey(spawn.id, user.id);
-      const row = await prisma.setting.findUnique({ where: { key } });
-      const amt = Math.max(0, Math.floor(Number(row?.value) || 0));
-      if (!row || amt <= 0) {
-        try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — no active bet to cancel.`); } catch {}
-        return;
-      }
-      await prisma.setting.delete({ where: { key } }).catch(() => {});
-      await addCoins(user.id, amt);
-      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} canceled the bet and got ${amt} coins back.`); } catch {}
-      return;
-    }
-
-    // place bet
     const amt = Math.floor(Number(parts[1] || 0));
     if (!Number.isFinite(amt) || amt <= 0) {
-      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`Usage: ${PREFIX}bet <amount> (or ${PREFIX}bet cancel)`); } catch {}
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`Usage: ${PREFIX}bet <amount>`); } catch {}
       return;
     }
+
+    // Apply the same 1.5s cooldown as !catch
+    const cdKey = userId ? `kick:${String(userId)}` : `kick:${String(username || "").toLowerCase()}`;
+    const now = Date.now();
+    const last = lastCatchAttemptAt.get(cdKey) || 0;
+    if (now - last < CATCH_COOLDOWN_MS) return;
+    lastCatchAttemptAt.set(cdKey, now);
+
     const spawn = await game.getActiveSpawn();
     if (!spawn) {
       try { await refreshKickTokenIfNeeded(); await sendKickChatMessage("No Pokémon active to bet on."); } catch {}
       return;
     }
+
     const user = await game.getOrCreateKickUser(username, userId);
-    const key = betKey(spawn.id, user.id);
-    const existing = await prisma.setting.findUnique({ where: { key } });
-    if (existing) {
-      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — you already placed a bet for this spawn. (${PREFIX}bet cancel)`); } catch {}
-      return;
-    }
-    const coins = await getCoins(user.id);
-    if (amt > coins) {
-      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — not enough coins. Balance: ${coins}`); } catch {}
+    const bal = await getLeaderPoints(user.id);
+    if (amt > bal) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — not enough LeaderPts. Balance: ${bal}`); } catch {}
       return;
     }
 
-    await setCoins(user.id, coins - amt);
-    await prisma.setting.create({ data: { key, value: String(amt) } });
+    // Deduct wager upfront
+    await addLpAdj(user.id, -amt);
 
-    const mult = payoutMultiplierForSpawn(spawn);
+    // Attempt catch (no name required)
+    const result = await game.tryCatch({
+      username,
+      platformUserId: userId,
+      guessName: ""
+    });
+
+    if (!result.ok) {
+      // Refund only if there wasn't an active spawn anymore / race condition.
+      if (result.reason === "no_spawn" || result.reason === "already_caught") {
+        await addLpAdj(user.id, amt);
+        try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — too late! Someone else got it. Bet refunded.`); } catch {}
+        return;
+      }
+
+      if (result.reason === "catch_failed") {
+        const pct = typeof result.chance === "number" ? Math.round(result.chance * 100) : null;
+        try {
+          await refreshKickTokenIfNeeded();
+          await sendKickChatMessage(
+            pct
+              ? `${username} bet ${amt} LeaderPts and it broke free! (lost bet) — (${pct}% catch chance)`
+              : `${username} bet ${amt} LeaderPts and it broke free! (lost bet)`
+          );
+        } catch {}
+        return;
+      }
+
+      // Other failure: refund
+      await addLpAdj(user.id, amt);
+      return;
+    }
+
+    const s = result.spawn;
+    const shinyTag = s.isShiny ? " ✨SHINY✨" : "";
+    const lvlTag = s.level ? `Lv. ${s.level} ` : "";
+
+    const mult = payoutMultiplierForSpawn(s);
+    const payout = Math.max(0, Math.floor(amt * mult));
+    await addLpAdj(user.id, payout);
+
     try {
       await refreshKickTokenIfNeeded();
-      await sendKickChatMessage(`${username} bet ${amt} coins on ${spawn.pokemon}! If you catch it, payout ≈ x${mult.toFixed(2)}.`);
+      await sendKickChatMessage(
+        `${username} bet ${amt} LeaderPts and caught ${lvlTag}${s.pokemon}${shinyTag}! +${payout} LeaderPts payout (x${mult.toFixed(2)}) + ${result.catch.pointsEarned} catch pts.`
+      );
     } catch {}
+
+    // Notify overlay
+    try {
+      overlayBroadcast({
+        type: "caught",
+        spawnId: s.id,
+        trainer: username,
+        pokemon: s.pokemon,
+        isShiny: !!s.isShiny,
+        sprite: spriteUrlForSpawn(s)
+      });
+      overlayBroadcast({ type: "clear" });
+      overlayLastSpawn = null;
+    } catch {}
+
     return;
   }
 
