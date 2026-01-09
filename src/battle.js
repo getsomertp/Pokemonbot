@@ -118,31 +118,32 @@ function simulateBattle(a, b, rng = defaultRng) {
 
   /**
    * Push an animation frame for the overlay.
-   * `action` is optional, and lets the overlay drive shake/flash/popups.
    *
    * action: {
-   *   kind: 'start'|'hit'|'miss'|'noeffect'|'faint'|'end',
-   *   attacker: 'L'|'R',
-   *   defender: 'L'|'R',
+   *   kind: 'start'|'sendout'|'use'|'hit'|'miss'|'noeffect'|'pause'|'faint'|'end',
+   *   attacker?: 'L'|'R',
+   *   defender?: 'L'|'R',
    *   moveName?: string,
    *   damage?: number,
    *   crit?: boolean,
    *   mult?: number
    * }
    */
-  function pushEvent(text, action) {
+  function pushEvent(text, action, durationMs) {
     events.push({
-      text,
+      text: text == null ? "" : String(text),
       leftHp: left.hp,
       leftMax: left.maxHP,
       rightHp: right.hp,
       rightMax: right.maxHP,
-      action: action || null
+      action: action || null,
+      durationMs: durationMs == null ? 1000 : Number(durationMs)
     });
   }
 
-  // Initial frame
-  pushEvent(`A wild ${right.name} appeared!`, { kind: "start" });
+  // Opening sequence (lets overlay do "send out" animations)
+  pushEvent(`A wild ${right.name} appeared!`, { kind: "start", defender: "R" }, 900);
+  pushEvent(`Go! ${left.name}!`, { kind: "sendout", attacker: "L" }, 900);
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (left.hp <= 0 || right.hp <= 0) break;
@@ -171,32 +172,40 @@ function simulateBattle(a, b, rng = defaultRng) {
       if (att.hp <= 0 || def.hp <= 0) continue;
       if (!mv) continue;
 
+      // 1) "X used MOVE!"
+      pushEvent(`${att.name} used ${mv.name}!`, { kind: "use", attacker: attSide, defender: defSide, moveName: mv.name }, 800);
+      if (turn <= 6) log.push(`${att.name} used ${mv.name}!`);
+
       const res = calcDamage({ attacker: att, defender: def, move: mv, rng });
+
+      // 2) Outcome frame (damage/effectiveness/etc)
       if (!res.hit) {
-        const t = `${att.name} used ${mv.name}… but missed!`;
-        if (turn <= 6) log.push(t);
-        pushEvent(t, { kind: "miss", attacker: attSide, defender: defSide, moveName: mv.name });
+        pushEvent(`But it missed!`, { kind: "miss", attacker: attSide, defender: defSide, moveName: mv.name }, 950);
+        if (turn <= 6) log.push("But it missed!");
         continue;
       }
+
       if (res.mult === 0) {
-        const t = `${att.name} used ${mv.name}… no effect!`;
-        if (turn <= 6) log.push(t);
-        pushEvent(t, { kind: "noeffect", attacker: attSide, defender: defSide, moveName: mv.name, mult: 0 });
+        pushEvent(`It had no effect!`, { kind: "noeffect", attacker: attSide, defender: defSide, moveName: mv.name, mult: 0 }, 950);
+        if (turn <= 6) log.push("It had no effect!");
         continue;
       }
 
       def.hp = Math.max(0, def.hp - res.damage);
 
-      const eff = res.mult >= 2 ? " It's super effective!" : res.mult <= 0.5 ? " It's not very effective…" : "";
-      const crit = res.crit ? " Critical hit!" : "";
-      const t = `${att.name} used ${mv.name}! (-${res.damage})${crit}${eff}`;
+      const lines = [];
+      lines.push(`-${res.damage} HP!`);
+      if (res.crit) lines.push("A critical hit!");
+      if (res.mult >= 2) lines.push("It's super effective!");
+      else if (res.mult > 0 && res.mult <= 0.5) lines.push("It's not very effective…");
 
-      if (turn <= 6) log.push(t);
-      pushEvent(t, { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult });
+      pushEvent(lines.join("\n"), { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult }, 950);
+      if (turn <= 6) log.push(lines.join(" "));
 
+      // Tiny pause before KO/final texts (feels more like Pokémon)
       if (def.hp <= 0) {
-        const faint = `${def.name} fainted!`;
-        pushEvent(faint, { kind: "faint", attacker: attSide, defender: defSide });
+        pushEvent("", { kind: "pause" }, 450);
+        pushEvent(`${def.name} fainted!`, { kind: "faint", attacker: attSide, defender: defSide }, 900);
         break;
       }
     }
@@ -208,7 +217,9 @@ function simulateBattle(a, b, rng = defaultRng) {
     : left.hp >= right.hp ? "left"
     : "right";
 
-  pushEvent(winner === "left" ? `${left.name} wins!` : `${right.name} wins!`, { kind: "end" });
+  // Small pause before the win text
+  pushEvent("", { kind: "pause" }, 450);
+  pushEvent(winner === "left" ? `${left.name} wins!` : `${right.name} wins!`, { kind: "end" }, 1100);
 
   return {
     winner,

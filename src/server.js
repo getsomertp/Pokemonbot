@@ -691,6 +691,12 @@ app.get("/overlay", (req, res) => {
     .sprite{image-rendering:pixelated;}
     .foeSprite{position:absolute; right:28px; top:40px; width:140px; height:140px;}
     .userSprite{position:absolute; left:28px; top:20px; width:150px; height:150px;}
+    /* Send-out animations (slide-in sprites) */
+    .userEnter{animation:userEnter 520ms cubic-bezier(.22,.9,.25,1.05) both;}
+    @keyframes userEnter{0%{left:-180px; opacity:0;} 70%{left:40px; opacity:1;} 100%{left:28px; opacity:1;}}
+    .foeEnter{animation:foeEnter 520ms cubic-bezier(.22,.9,.25,1.05) both;}
+    @keyframes foeEnter{0%{right:-180px; opacity:0;} 70%{right:40px; opacity:1;} 100%{right:28px; opacity:1;}}
+
     .side{position:absolute; padding:12px 14px; border-radius:16px; background:rgba(0,0,0,0.55); backdrop-filter:blur(6px); min-width:240px;}
     .side.foe{left:22px; top:26px;}
     .side.user{right:22px; top:24px;}
@@ -881,7 +887,7 @@ app.get("/overlay", (req, res) => {
     }
 
     function stopBattleTimer(){
-      if(battleTimer){ clearInterval(battleTimer); battleTimer=null; }
+      if(battleTimer){ clearTimeout(battleTimer); battleTimer=null; }
       battleIndex = 0;
     }
 
@@ -949,65 +955,98 @@ app.get("/overlay", (req, res) => {
       if(moveLog) moveLog.innerHTML = "";
       if(popup) popup.classList.remove("show");
 
-      function renderFrame(i){
-        const fr = frames[i];
-        if(!fr) return;
-        if(battleText) battleText.textContent = fr.text || "";
-        setHp(userHp, fr.leftHp ?? uMax, fr.leftMax ?? uMax);
-        setHp(foeHp, fr.rightHp ?? fMax, fr.rightMax ?? fMax);
-        battleEl.classList.remove("flash"); void battleEl.offsetWidth; battleEl.classList.add("flash");
+function animateEnter(spriteEl, cls){
+  if(!spriteEl) return;
+  spriteEl.classList.remove(cls);
+  void spriteEl.offsetWidth;
+  spriteEl.classList.add(cls);
+  setTimeout(()=>{ try{ spriteEl.classList.remove(cls); }catch{} }, 700);
+}
 
-        // Enhanced animation events (new frames include fr.action)
-        const a = fr.action || null;
-        if(a){
-          const atkName = a.attacker === 'L' ? (b.user?.name || 'You') : (b.foe?.name || 'Wild');
-          const defSprite = a.defender === 'L' ? userSprite : foeSprite;
+function renderFrame(i){
+  const fr = frames[i];
+  if(!fr) return;
 
-          if(a.kind === 'hit'){
-            // Turn-by-turn shake/flash on damage
-            pulse(defSprite, 'shake');
-            pulse(defSprite, 'hitFlash');
+  const a = fr.action || null;
 
-            // Move log
-            const dmg = (a.damage != null) ? (' -' + a.damage) : '';
-            let effTag = '';
-            if(a.mult >= 4) effTag = ' (SUPER!)';
-            else if(a.mult === 2) effTag = ' (SUPER)';
-            else if(a.mult > 0 && a.mult <= 0.5) effTag = ' (RESIST)';
-            const critTag = a.crit ? ' (CRIT)' : '';
-            pushMoveLine(atkName + ' used ' + (a.moveName || 'a move') + dmg + effTag + critTag);
+  // Text + HP
+  if(battleText) battleText.textContent = fr.text || "";
+  setHp(userHp, fr.leftHp ?? uMax, fr.leftMax ?? uMax);
+  setHp(foeHp, fr.rightHp ?? fMax, fr.rightMax ?? fMax);
 
-            // Type effectiveness popup
-            if(a.mult >= 2) showPopup('SUPER EFFECTIVE!');
-            else if(a.mult > 0 && a.mult <= 0.5) showPopup('NOT VERY EFFECTIVE…');
-            else if(a.crit) showPopup('CRITICAL HIT!');
-          }
+  // Subtle flash on most frames, but skip on pause frames
+  if(!a || a.kind !== 'pause'){
+    battleEl.classList.remove("flash"); void battleEl.offsetWidth; battleEl.classList.add("flash");
+  }
 
-          if(a.kind === 'miss'){
-            pushMoveLine(atkName + ' missed ' + (a.moveName || 'a move') + '!');
-            showPopup('MISS!');
-          }
+  // Animation / popups / move log
+  if(a){
+    const atkName = a.attacker === 'L' ? (b.user?.name || 'You') : (b.foe?.name || 'Wild');
+    const defSprite = a.defender === 'L' ? userSprite : foeSprite;
 
-          if(a.kind === 'noeffect'){
-            pushMoveLine(atkName + ' used ' + (a.moveName || 'a move') + ' (NO EFFECT)');
-            showPopup('NO EFFECT!');
-          }
-        }
-      }
+    if(a.kind === 'start'){
+      // Wild appears
+      animateEnter(foeSprite, 'foeEnter');
+    }
 
-      renderFrame(0);
+    if(a.kind === 'sendout'){
+      animateEnter(userSprite, 'userEnter');
+    }
 
-      // 1 second per frame to feel like classic turn-by-turn battles
-      battleTimer = setInterval(()=>{
-        battleIndex++;
-        if(battleIndex >= frames.length){
-          stopBattleTimer();
-          // leave battle visible briefly, then hide
-          setTimeout(()=>{ hideBattle(); }, 600);
-          return;
-        }
-        renderFrame(battleIndex);
-      }, 1000);
+    if(a.kind === 'use'){
+      // "X used MOVE!" (log only; battleText already shows it)
+      pushMoveLine(atkName + ' used ' + (a.moveName || 'a move') + '!');
+    }
+
+    if(a.kind === 'hit'){
+      // Turn-by-turn shake/flash on damage
+      pulse(defSprite, 'shake');
+      pulse(defSprite, 'hitFlash');
+
+      // Log details as a follow-up line
+      const dmg = (a.damage != null) ? (' -' + a.damage) : '';
+      let effTag = '';
+      if(a.mult >= 4) effTag = ' (SUPER!)';
+      else if(a.mult === 2) effTag = ' (SUPER)';
+      else if(a.mult > 0 && a.mult <= 0.5) effTag = ' (RESIST)';
+      const critTag = a.crit ? ' (CRIT)' : '';
+      pushMoveLine('↳' + dmg + effTag + critTag);
+
+      // Type effectiveness popup (prioritize effectiveness over crit)
+      if(a.mult >= 2) showPopup('SUPER EFFECTIVE!');
+      else if(a.mult > 0 && a.mult <= 0.5) showPopup('NOT VERY EFFECTIVE…');
+      else if(a.crit) showPopup('CRITICAL HIT!');
+    }
+
+    if(a.kind === 'miss'){
+      pushMoveLine('↳ MISS!');
+      showPopup('MISS!');
+    }
+
+    if(a.kind === 'noeffect'){
+      pushMoveLine('↳ NO EFFECT');
+      showPopup('NO EFFECT!');
+    }
+  }
+}
+
+// Play frames with per-frame duration (default 1s).
+function scheduleNext(){
+  if(battleIndex >= frames.length){
+    stopBattleTimer();
+    setTimeout(()=>{ hideBattle(); }, 650);
+    return;
+  }
+  renderFrame(battleIndex);
+  const fr = frames[battleIndex];
+  const ms = Math.max(120, Number(fr?.durationMs || 1000));
+  battleIndex++;
+  battleTimer = setTimeout(scheduleNext, ms);
+}
+
+stopBattleTimer();
+battleIndex = 0;
+scheduleNext();
     }
 
 
@@ -1337,7 +1376,7 @@ async function handleChat({ username, userId, content }) {
     // Notify overlay: play battle animation.
     try {
       const framesAll = (result.events || result.simEvents || result.frames || []);
-      const frames = framesAll.slice(0, 40); // cap to keep overlay snappy
+      const frames = framesAll.slice(0, 80); // cap to keep overlay snappy
       overlayBroadcast({
         type: "battle",
         battle: {
@@ -1365,11 +1404,15 @@ async function handleChat({ username, userId, content }) {
     // We keep this concise to avoid flooding chat: up to 6 turn lines + final.
     const evs = Array.isArray(result.events) ? result.events : [];
     const turnLines = evs
-      .filter(e => e && typeof e.text === 'string' && e.text.trim())
-      .map(e => e.text.trim())
-      .slice(0, 7); // include start + a few turns
+  .filter(e => {
+    const k = e?.action?.kind;
+    return !!k && ["start","sendout","use","miss","noeffect","faint"].includes(k);
+  })
+  .map(e => String(e.text || "").trim())
+  .filter(Boolean)
+  .slice(0, 7); // keep it concise
 
-    const battleMs = Math.min(12000, Math.max(2500, (Math.min(40, evs.length || 0) * 1000) + 600));
+    const battleMs = Math.min(15000, Math.max(2500, frames.reduce((acc,f)=>acc + (Number(f?.durationMs)||1000), 0) + 600));
 
     try {
       await refreshKickTokenIfNeeded();
