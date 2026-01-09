@@ -76,8 +76,15 @@ function calcDamage({
 
   const lvl = clamp(Number(attacker.level || 5), 1, 100);
   const cls = String(move?.damageClass || move?.damageClassName || move?.damage_class || "physical").toLowerCase();
-  const A = cls === "special" ? Number(attacker.stats?.spAtk || attacker.stats?.spA || 1) : Number(attacker.stats?.atk || 1);
-  const D = cls === "special" ? Number(defender.stats?.spDef || defender.stats?.spD || 1) : Number(defender.stats?.def || 1);
+  // Our dex.computeStats() uses spa/spd field names.
+  // Support both common spellings so damage isn't accidentally calculated with 1 as the special stats.
+  const atkSp = Number(attacker.stats?.spAtk ?? attacker.stats?.spA ?? attacker.stats?.spa ?? 1);
+  const defSp = Number(defender.stats?.spDef ?? defender.stats?.spD ?? defender.stats?.spd ?? 1);
+  const atkPh = Number(attacker.stats?.atk ?? 1);
+  const defPh = Number(defender.stats?.def ?? 1);
+
+  const A = cls === "special" ? atkSp : atkPh;
+  const D = cls === "special" ? defSp : defPh;
 
   const levelFactor = Math.floor((2 * lvl) / 5) + 2;
   const base = Math.floor(Math.floor((levelFactor * power * Math.max(1, A)) / Math.max(1, D)) / 50) + 2;
@@ -264,10 +271,9 @@ function buildBattleMonFromDex({ nameOrId, level }) {
 
   const lvl = clamp(Number(level || 5), 1, 100);
   const stats = dex.computeStats(mon.baseStats, lvl);
-  const moveIds = dex.getMovesForLevel(mon, lvl);
-  const moves = moveIds
-    .map((id) => mon.moves?.[id])
-    .filter(Boolean)
+  // dex.getMovesForLevel() already returns move objects (not IDs).
+  // Previous versions treated these as IDs, resulting in empty movesets and instant battles.
+  const moves = (dex.getMovesForLevel(mon, lvl) || [])
     .map((m) => ({
       id: m.id,
       name: m.name,
