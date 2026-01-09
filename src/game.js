@@ -226,30 +226,7 @@ class Game {
     }));
   }
 
-  
-  async leaderboardSince(sinceDate, limit = 10) {
-    const since = sinceDate instanceof Date ? sinceDate : new Date(sinceDate);
-    const rows = await prisma.catch.groupBy({
-      by: ["userId"],
-      where: { caughtAt: { gte: since } },
-      _sum: { pointsEarned: true },
-      orderBy: { _sum: { pointsEarned: "desc" } },
-      take: limit
-    });
-
-    const users = await prisma.user.findMany({
-      where: { id: { in: rows.map((r) => r.userId) } }
-    });
-    const userMap = new Map(users.map((u) => [u.id, u]));
-    return rows.map((r, i) => ({
-      rank: i + 1,
-      userId: r.userId,
-      name: userMap.get(r.userId)?.displayName || "unknown",
-      points: r._sum.pointsEarned || 0
-    }));
-  }
-
-async userStats(username) {
+  async userStats(username) {
     const handle = String(username || "").toLowerCase();
     const ident = await prisma.userIdentity.findUnique({
       where: { platform_handle: { platform: "kick", handle } },
