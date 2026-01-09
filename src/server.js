@@ -28,6 +28,49 @@ app.use("/sounds", express.static(path.join(__dirname, "..", "public", "sounds")
 
 // Static assets (OBS overlay sounds, etc.)
 app.use(express.static(path.join(__dirname, "..", "public")));
+// ---- Sprite proxy (OBS-friendly) ----
+// OBS Browser Source + GitHub raw can intermittently return HTML (rate limits/blocks),
+// which makes sprites appear "corrupted". We proxy + cache sprites server-side so
+// the overlay always receives a real PNG with correct headers.
+const spriteCache = new Map(); // key -> { buf: Buffer, ts: number }
+const SPRITE_CACHE_TTL_MS = 1000 * 60 * 60 * 24; // 24h
+
+async function fetchSpriteBuffer(url) {
+  const now = Date.now();
+  const cached = spriteCache.get(url);
+  if (cached && (now - cached.ts) < SPRITE_CACHE_TTL_MS) return cached.buf;
+
+  const r = await fetch(url, { headers: { "User-Agent": "pokebot-overlay" } });
+  if (!r.ok) throw new Error(`sprite fetch failed ${r.status}`);
+  const ab = await r.arrayBuffer();
+  const buf = Buffer.from(ab);
+  // quick sanity check: PNG signature
+  if (buf.length < 8 || !buf.slice(0, 8).equals(Buffer.from([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]))) {
+    throw new Error("sprite not a png");
+  }
+  spriteCache.set(url, { buf, ts: now });
+  return buf;
+}
+
+app.get("/sprites/:variant(normal|shiny)/:dex.png", async (req, res) => {
+  try {
+    const dexNum = Number(req.params.dex);
+    if (!Number.isFinite(dexNum) || dexNum <= 0 || dexNum > 151) {
+      return res.status(404).send("not found");
+    }
+    const variant = req.params.variant;
+    const base = "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon";
+    const upstream = variant === "shiny" ? `${base}/shiny/${dexNum}.png` : `${base}/${dexNum}.png`;
+
+    const buf = await fetchSpriteBuffer(upstream);
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    return res.status(200).send(buf);
+  } catch (e) {
+    return res.status(502).send("sprite unavailable");
+  }
+});
+
 
 const PORT = Number(process.env.PORT || 3000);
 const PREFIX = process.env.COMMAND_PREFIX || "!";
@@ -153,9 +196,9 @@ function spriteUrlForSpawn(spawn) {
     const mon = d.pokemon.find((x) => x.id === spawn.pokemonId) || d.pokemon.find((x) => x.name === spawn.pokemon);
     const dexNum = mon?.dex;
     if (!dexNum) return null;
-    const base = 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon';
+    const base = '/sprites';
     if (spawn.isShiny) return `${base}/shiny/${dexNum}.png`;
-    return `${base}/${dexNum}.png`;
+    return `${base}/normal/${dexNum}.png`;
   } catch {
     return null;
   }
