@@ -716,6 +716,12 @@ app.get("/overlay", (req, res) => {
     .hitFlash{animation: hitFlash 180ms ease-out;}
     @keyframes hitFlash{from{filter:brightness(1.9) contrast(1.05);} to{filter:brightness(1) contrast(1);}}
 
+    /* Attack "lunge" when using a move */
+    .attackUser{animation: userAttack 260ms ease-out;}
+    @keyframes userAttack{0%{transform:translate(0,0);} 45%{transform:translate(18px,-4px);} 100%{transform:translate(0,0);} }
+    .attackFoe{animation: foeAttack 260ms ease-out;}
+    @keyframes foeAttack{0%{transform:translate(0,0);} 45%{transform:translate(-18px,4px);} 100%{transform:translate(0,0);} }
+
     /* Effectiveness / crit popup */
     #popup{position:absolute; left:50%; top:160px; transform:translateX(-50%); display:none; padding:10px 14px; border-radius:14px; background:rgba(0,0,0,0.70); backdrop-filter:blur(6px); font-weight:900; letter-spacing:0.5px; font-size:20px; text-transform:uppercase; white-space:nowrap;}
     #popup.show{display:block; animation: popup 850ms ease-out both;}
@@ -996,6 +1002,10 @@ function renderFrame(i){
     if(a.kind === 'use'){
       // "X used MOVE!" (log only; battleText already shows it)
       pushMoveLine(atkName + ' used ' + (a.moveName || 'a move') + '!');
+
+      // Attacker "lunge" animation like Pokémon (brief forward jab)
+      const atkSprite = a.attacker === 'L' ? userSprite : foeSprite;
+      pulse(atkSprite, a.attacker === 'L' ? 'attackUser' : 'attackFoe');
     }
 
     if(a.kind === 'hit'){
