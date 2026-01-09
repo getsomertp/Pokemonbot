@@ -620,6 +620,7 @@ app.get("/state", async (req, res) => {
 });
 
 // ---------- OBS Overlay ----------
+// Visual-only overlay (audio is handled via OBS Media Source for reliability in OBS CEF).
 app.get("/overlay", (req, res) => {
   const showUi = String(req.query.ui || "") === "1";
   const html = `<!doctype html>
@@ -631,210 +632,189 @@ app.get("/overlay", (req, res) => {
   <style>
     html,body{margin:0; padding:0; width:450px; height:450px; background:transparent; overflow:hidden;}
     #wrap{position:relative; width:450px; height:450px;}
-    #card{position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); display:none; align-items:center; gap:18px; padding:14px 18px; border-radius:18px; background:rgba(0,0,0,0.55); backdrop-filter:blur(6px); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
-    #sprite{width:160px; height:160px; image-rendering:pixelated;}
-    #name{font-size:28px; font-weight:800; line-height:1.1; white-space:nowrap; max-width:240px; overflow:hidden; text-overflow:ellipsis;}
-    #meta{opacity:0.9; font-size:18px;}
-    .shiny{filter: drop-shadow(0 0 18px rgba(255,255,255,0.9)); animation: shimmer 1.2s ease-in-out infinite;}
-    @keyframes shimmer{0%{filter: drop-shadow(0 0 10px rgba(255,255,255,0.45));} 50%{filter: drop-shadow(0 0 24px rgba(255,255,255,0.95));} 100%{filter: drop-shadow(0 0 10px rgba(255,255,255,0.45));}}
-    .pop{animation: pop 300ms ease-out;}
-    @keyframes pop{from{transform:translate(-50%,-50%) scale(0.85); opacity:0;} to{transform:translate(-50%,-50%) scale(1); opacity:1;}}
-    #barWrap{margin-top:10px; width:260px; height:10px; background:rgba(255,255,255,0.20); border-radius:999px; overflow:hidden;}
+    #card{position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); width:420px; height:420px;
+          display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px;
+          background:rgba(0,0,0,0.35); border:1px solid rgba(255,255,255,0.20); border-radius:26px;
+          box-shadow:0 12px 40px rgba(0,0,0,0.45); backdrop-filter: blur(6px); }
+    #sprite{width:160px; height:160px; image-rendering:pixelated; display:none;}
+    #name{font-size:28px; font-weight:800; line-height:1.1; white-space:nowrap; max-width:340px; overflow:hidden; text-overflow:ellipsis;
+          font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:#fff; display:none;}
+    #meta{opacity:0.92; font-size:18px; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:#fff; display:none;}
+    #barWrap{margin-top:10px; width:260px; height:10px; background:rgba(255,255,255,0.20); border-radius:999px; overflow:hidden; display:none;}
     #bar{width:100%; height:100%; background:rgba(255,255,255,0.85); transform-origin:left center;}
-    #toast{position:absolute; left:50%; top:calc(50% + 125px); transform:translateX(-50%); display:none; padding:10px 14px; border-radius:14px; background:rgba(0,0,0,0.60); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:20px; white-space:nowrap;}
-    #toast.show{display:block; animation: toast 1400ms ease-out both;}
-    @keyframes toast{0%{transform:translate(-50%,-6px); opacity:0;} 12%{transform:translate(-50%,0); opacity:1;} 80%{opacity:1;} 100%{transform:translate(-50%,6px); opacity:0;}}
-    #unlock{position:absolute; left:50%; top:16px; transform:translateX(-50%); display:none; padding:10px 14px; border-radius:12px; border:0; background:rgba(0,0,0,0.65); color:white; font-family:system-ui; font-size:14px; cursor:pointer;}
-    ${showUi ? '#ui{position:absolute; right:16px; bottom:16px; background:rgba(0,0,0,0.5); color:white; padding:12px; border-radius:12px; font-family:system-ui;}' : '#ui{display:none;}'}
+    #toast{position:absolute; left:50%; top:calc(50% + 125px); transform:translateX(-50%);
+           padding:10px 14px; border-radius:999px; background:rgba(0,0,0,0.55); border:1px solid rgba(255,255,255,0.20);
+           color:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:20px; white-space:nowrap; display:none;}
+    #toast.show{display:block; animation: pop 300ms ease-out;}
+    @keyframes pop{from{transform:translateX(-50%) scale(0.92); opacity:0;} to{transform:translateX(-50%) scale(1); opacity:1;}}
+    .shiny{filter: drop-shadow(0 0 18px rgba(255,255,255,0.9)); animation: shimmer 1.2s ease-in-out infinite;}
+    @keyframes shimmer{0%{filter: drop-shadow(0 0 10px rgba(255,255,255,0.45));} 50%{filter: drop-shadow(0 0 18px rgba(255,255,255,0.9));} 100%{filter: drop-shadow(0 0 10px rgba(255,255,255,0.45));}}
+
+    /* Optional debug UI */
+    #ui{position:absolute; left:10px; top:10px; width:430px; color:#fff;
+        font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:14px; display:none;}
+    #ui.show{display:block;}
+    #ui code{background:rgba(0,0,0,0.35); padding:2px 6px; border-radius:6px;}
   </style>
 </head>
 <body>
   <div id="wrap">
     <div id="card">
-      <img id="sprite"/>
-      <div>
-        <div id="name"></div>
-        <div id="meta"></div>
-        <div id="barWrap"><div id="bar"></div></div>
-      </div>
+      <img id="sprite" />
+      <div id="name"></div>
+      <div id="meta"></div>
+      <div id="barWrap"><div id="bar"></div></div>
     </div>
     <div id="toast"></div>
-    <button id="unlock">Click to enable battle sound</button>
-    <div id="ui">
-      <div><b>Sound</b>: <span id="uiEnabled">?</span></div>
-      <div>Vol: <span id="uiVol">?</span></div>
-      <input id="uiSlider" type="range" min="0" max="100" value="50" style="width:220px"/>
-    </div>
-    <audio id="loop" src="/sounds/wild_battle.mp3" loop preload="auto"></audio>
+    <div id="ui"><div>WS: <code id="ws"></code></div><div>Active: <code id="act"></code></div></div>
   </div>
 
-  <script>
-    const card = document.getElementById("card");
-    const sprite = document.getElementById("sprite");
-    const nameEl = document.getElementById("name");
-    const metaEl = document.getElementById("meta");
-    const bar = document.getElementById("bar");
-    const toast = document.getElementById("toast");
-    const unlockBtn = document.getElementById("unlock");
-    const audioEl = document.getElementById("loop");
-    const uiEnabled = document.getElementById("uiEnabled");
-    const uiVol = document.getElementById("uiVol");
-    const uiSlider = document.getElementById("uiSlider");
+<script>
+(() => {
+  const sprite = document.getElementById("sprite");
+  const nameEl = document.getElementById("name");
+  const metaEl = document.getElementById("meta");
+  const barWrap = document.getElementById("barWrap");
+  const bar = document.getElementById("bar");
+  const toast = document.getElementById("toast");
+  const ui = document.getElementById("ui");
+  const uiWs = document.getElementById("ws");
+  const uiAct = document.getElementById("act");
 
-    let currentSpawn = null;
-    let soundEnabled = true;
-    let targetVolume = 0.5;
+  const showUi = ${showUi ? "true" : "false"};
+  if(showUi) ui.classList.add("show");
 
-    // ---- Audio ----
-    // OBS Browser Source runs on CEF; autoplay can be blocked until a user interaction.
-    // We "prime" audio by attempting a muted play on load (muted autoplay is usually allowed),
-    // then we unmute + play when a Pokémon spawns or the user clicks unlock.
-    let primed = false;
-    async function primeAudio(){
-      if(primed) return true;
-      try{
-        audioEl.muted = true;
-        audioEl.volume = 0;
-        await audioEl.play();
-        // tiny delay so the play() actually starts before we pause
-        setTimeout(()=>{ try{ audioEl.pause(); audioEl.currentTime = 0; }catch{} }, 50);
-        primed = true;
-        return true;
-      }catch(e){
-        return false;
+  let currentSpawn = null;
+  let tickTimer = null;
+
+  function fmtTier(t){ return (t||"").toUpperCase(); }
+
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.classList.add("show");
+    setTimeout(()=> toast.classList.remove("show"), 1500);
+  }
+
+  function clearTick(){
+    if(tickTimer){ clearInterval(tickTimer); tickTimer=null; }
+  }
+
+  function setActive(spawn){
+    currentSpawn = spawn;
+    if(uiAct) uiAct.textContent = spawn ? "true" : "false";
+
+    if(!spawn){
+      sprite.style.display = "none";
+      nameEl.style.display = "none";
+      metaEl.style.display = "none";
+      barWrap.style.display = "none";
+      sprite.classList.remove("shiny");
+      sprite.src = "";
+      nameEl.textContent = "";
+      metaEl.textContent = "";
+      bar.style.transform = "scaleX(1)";
+      clearTick();
+      return;
+    }
+
+    sprite.style.display = "block";
+    nameEl.style.display = "block";
+    metaEl.style.display = "block";
+    barWrap.style.display = "block";
+
+    sprite.src = spawn.spriteUrl || "";
+    nameEl.textContent = spawn.displayName || spawn.pokemon || "???";
+    metaEl.textContent = \`Lv. \${spawn.level} • \${fmtTier(spawn.tier)}\${spawn.isShiny ? " • SHINY" : ""}\`;
+    if(spawn.isShiny) sprite.classList.add("shiny"); else sprite.classList.remove("shiny");
+
+    // timer bar
+    const expiresAt = spawn.expiresAt ? new Date(spawn.expiresAt).getTime() : null;
+    const spawnedAt = spawn.spawnedAt ? new Date(spawn.spawnedAt).getTime() : Date.now();
+    const totalMs = expiresAt ? Math.max(1, expiresAt - spawnedAt) : 45000;
+
+    clearTick();
+    tickTimer = setInterval(() => {
+      const now = Date.now();
+      const left = expiresAt ? Math.max(0, expiresAt - now) : 0;
+      const pct = expiresAt ? (left / totalMs) : 1;
+      bar.style.transform = "scaleX(" + Math.max(0, Math.min(1, pct)) + ")";
+      if(expiresAt && left <= 0){
+        clearTick();
       }
-    }
-
-    function setVol(v){
-      targetVolume = Math.max(0, Math.min(1, v));
-      if(gain && ctx){ try{ gain.gain.setValueAtTime(targetVolume, ctx.currentTime); }catch{} }
-      audioEl.volume = targetVolume;
-      if(uiVol) uiVol.textContent = Math.round(targetVolume*100)+"%";
-      if(uiSlider && document.getElementById("ui").style.display!=="none") uiSlider.value = String(Math.round(targetVolume*100));
-    }
-
-    function setEnabled(en){
-      soundEnabled = !!en;
-      if(uiEnabled) uiEnabled.textContent = soundEnabled ? "ON" : "OFF";
-      if(!soundEnabled) fadeOutAndStop(150);
-      else if(currentSpawn) startLoop();
-    }
-
-    async function startLoop(){
-  if(!soundEnabled) return;
-  // Try playing normally first. If blocked, show unlock.
-  try{
-    // If we primed earlier, ensure we're unmuted and audible now.
-    audioEl.muted = false;
-    audioEl.volume = targetVolume;
-    audioEl.currentTime = 0;
-    await audioEl.play();
-    if(unlockBtn) unlockBtn.style.display = "none";
-  }catch(e){
-    // Attempt to prime (muted autoplay), then require explicit click to unmute.
-    await primeAudio();
-    if(unlockBtn) unlockBtn.style.display = "block";
+    }, 100);
   }
-}
 
-function fadeOutAndStop(ms){
-  try{
-    const start = audioEl.volume;
-    const steps = 12;
-    let i = 0;
-    const stepMs = Math.max(16, Math.floor(ms/steps));
-    const int = setInterval(()=>{
-      i++;
-      const v = Math.max(0, start*(1 - i/steps));
-      audioEl.volume = v;
-      if(i >= steps){
-        clearInterval(int);
-        try{ audioEl.pause(); audioEl.currentTime = 0; }catch{}
-        audioEl.muted = true; // keep muted so future prime attempts are allowed
-        audioEl.volume = 0;
-        // restore "intended" volume for next startLoop
-        setTimeout(()=>{ try{ audioEl.muted = false; audioEl.volume = targetVolume; }catch{} }, 0);
-      }
-    }, stepMs);
-  }catch(e){
-    try{ audioEl.pause(); audioEl.currentTime=0; }catch{}
-  }
-}
-
-function show(spawn){
-      if(!spawn || !spawn.sprite) return;
-      currentSpawn = spawn;
-      sprite.src = spawn.sprite;
-      sprite.className = spawn.isShiny ? "shiny" : "";
-      nameEl.textContent = (spawn.isShiny ? "✨ " : "") + spawn.name;
-      metaEl.textContent = 'Lv. ' + spawn.level + ' • ' + spawn.tier;
-      card.style.display = "flex";
-      card.classList.remove("pop"); void card.offsetWidth; card.classList.add("pop");
-      startLoop();
-    }
-
-    function clear(){ currentSpawn=null; card.style.display = "none"; if(unlockBtn) unlockBtn.style.display="none"; fadeOutAndStop(650); }
-    function caught(trainer, pokemon, isShiny){ toast.textContent = '🎮 ' + trainer + ' caught ' + (isShiny ? '✨ ' : '') + pokemon + '!'; toast.classList.remove("show"); void toast.offsetWidth; toast.classList.add("show"); clear(); }
-    function despawn(){ clear(); }
-
-    function tickBar(){
-      try{
-        if(!currentSpawn || !currentSpawn.spawnedAt || !currentSpawn.expiresAt){ requestAnimationFrame(tickBar); return; }
-        const start = new Date(currentSpawn.spawnedAt).getTime();
-        const end = new Date(currentSpawn.expiresAt).getTime();
-        const now = Date.now();
-        const pct = Math.max(0, Math.min(1, (end-now)/(end-start)));
-        bar.style.transform = 'scaleX(' + pct + ')';
-        requestAnimationFrame(tickBar);
-      }catch(e){ requestAnimationFrame(tickBar); }
-    }
-    tickBar();
-
-    // unlock audio via click (requires OBS "Interact" to click the browser source)
-async function unlockAndPlay(){
-  try{ await primeAudio(); }catch{}
-  try{
-    audioEl.muted = false;
-    audioEl.volume = targetVolume;
-    audioEl.currentTime = 0;
-    await audioEl.play();
-    if(unlockBtn) unlockBtn.style.display = "none";
-  }catch(e){
-    if(unlockBtn) unlockBtn.style.display = "block";
-  }
-}
-
-if(unlockBtn){
-  unlockBtn.addEventListener("click", unlockAndPlay);
-}
-// Also treat any click on the overlay as an unlock gesture (helpful in OBS).
-document.addEventListener("click", ()=>{
-  if(unlockBtn && unlockBtn.style.display !== "none") unlockAndPlay();
-}, { passive:true });
-
-// Prime audio on load (muted autoplay)
-setTimeout(()=>{ primeAudio(); }, 0);
-
-// Optional UI slider (if ?ui=1) (if ?ui=1)
-    if(uiSlider){ uiSlider.oninput = ()=>{ setVol(Number(uiSlider.value)/100); }; }
-
+  // WebSocket live updates (preferred)
+  function connectWs(){
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(proto + '://' + location.host + '/overlay/ws');
-    ws.onmessage = (e)=>{
+    const wsUrl = proto + "://" + location.host + "/overlay/ws";
+    const ws = new WebSocket(wsUrl);
+    if(uiWs) uiWs.textContent = "connecting";
+    ws.onopen = () => { if(uiWs) uiWs.textContent = "open"; };
+    ws.onclose = () => { if(uiWs) uiWs.textContent = "closed"; setTimeout(connectWs, 1500); };
+    ws.onerror = () => { if(uiWs) uiWs.textContent = "error"; };
+    ws.onmessage = (ev) => {
       try{
-        const msg = JSON.parse(e.data);
-        if(msg.type === "spawn") show(msg.spawn);
-        if(msg.type === "clear") clear();
-        if(msg.type === "despawn") despawn();
-        if(msg.type === "caught") caught(msg.trainer || "Someone", msg.pokemon || "a Pokémon", !!msg.isShiny);
-        if(msg.type === "sound_settings" && msg.settings){ setEnabled(msg.settings.enabled); setVol(msg.settings.volume); }
+        const msg = JSON.parse(ev.data);
+        if(msg.type === "spawn"){
+          setActive(msg.spawn || null);
+          if(msg.spawn) showToast("A wild " + (msg.spawn.displayName || msg.spawn.pokemon) + " appeared!");
+        }
+        if(msg.type === "clear"){
+          setActive(null);
+        }
       }catch{}
     };
-  </script>
+  }
+
+  // Fallback: poll state endpoint
+  async function pollState(){
+    try{
+      const r = await fetch("/overlay/state", { cache:"no-store" });
+      const j = await r.json();
+      setActive(j.spawn || null);
+    }catch{}
+    setTimeout(pollState, 2000);
+  }
+
+  connectWs();
+  pollState();
+})();
+</script>
 </body>
 </html>`;
+  res.setHeader("content-type", "text/html; charset=utf-8");
+  res.send(html);
+});
 
-  res.status(200).type("html").send(html);
+// JSON state for OBS automation (polling) and external tools
+app.get("/overlay/state", async (req, res) => {
+  try {
+    const s = await game.getActiveSpawn();
+    if (!s) return res.json({ active: false, spawn: null });
+
+    // sprite is served by existing endpoint(s) in the app; keep compatibility with previous overlay
+    const spriteUrl = `/sprite/${encodeURIComponent(s.pokemonId || s.pokemon)}`;
+
+    res.json({
+      active: true,
+      spawn: {
+        id: s.id,
+        pokemon: s.pokemon,
+        pokemonId: s.pokemonId,
+        displayName: (s.pokemon || "").replace(/^\w/, (c) => c.toUpperCase()),
+        tier: s.tier,
+        level: s.level,
+        isShiny: s.isShiny,
+        catchRate: s.catchRate,
+        spawnedAt: s.spawnedAt,
+        expiresAt: s.expiresAt,
+        spriteUrl
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ active: false, spawn: null, error: "internal_error" });
+  }
 });
 
 app.post("/admin/spawn", async (req, res) => {
