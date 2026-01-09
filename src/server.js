@@ -704,7 +704,7 @@ app.get("/overlay", (req, res) => {
     .label span{max-width:170px; overflow:hidden; text-overflow:ellipsis;}
     .hpWrap{margin-top:10px; width:100%; height:12px; background:rgba(255,255,255,0.20); border-radius:999px; overflow:hidden;}
     .hp{width:100%; height:100%; background:rgba(255,255,255,0.90); transform-origin:left center; transition: transform 520ms linear;}
-    #battleText{position:absolute; left:22px; right:22px; bottom:18px; padding:14px 16px; border-radius:16px; background:rgba(0,0,0,0.65); backdrop-filter:blur(6px); font-size:18px; line-height:1.25; min-height:54px;}
+    #battleText{position:absolute; left:22px; right:22px; bottom:18px; padding:14px 16px; border-radius:16px; background:rgba(0,0,0,0.65); backdrop-filter:blur(6px); font-size:18px; line-height:1.25; min-height:54px; white-space:pre-line;}
     #battle.flash{animation: battleFlash 180ms ease-out;}
     @keyframes battleFlash{from{transform:scale(0.99); opacity:0.85;} to{transform:scale(1); opacity:1;}}
 
@@ -977,8 +977,28 @@ function renderFrame(i){
 
   // Text + HP
   if(battleText) battleText.textContent = fr.text || "";
-  setHp(userHp, fr.leftHp ?? uMax, fr.leftMax ?? uMax);
-  setHp(foeHp, fr.rightHp ?? fMax, fr.rightMax ?? fMax);
+
+  // Default: render HP from the frame snapshot.
+  // Special case: impact frames carry hpFrom/hpTo so we can tick down like mainline Pokémon.
+  const isImpact = a && a.kind === 'impact' && (a.hpFrom != null) && (a.hpTo != null);
+  if(isImpact){
+    // Show pre-hit HP immediately, then tick down shortly after.
+    if(a.defender === 'L') setHp(userHp, a.hpFrom, fr.leftMax ?? uMax);
+    else setHp(foeHp, a.hpFrom, fr.rightMax ?? fMax);
+    // Ensure the other bar still updates correctly.
+    if(a.defender === 'L') setHp(foeHp, fr.rightHp ?? fMax, fr.rightMax ?? fMax);
+    else setHp(userHp, fr.leftHp ?? uMax, fr.leftMax ?? uMax);
+
+    setTimeout(()=>{
+      try{
+        if(a.defender === 'L') setHp(userHp, a.hpTo, fr.leftMax ?? uMax);
+        else setHp(foeHp, a.hpTo, fr.rightMax ?? fMax);
+      }catch{}
+    }, 90);
+  } else {
+    setHp(userHp, fr.leftHp ?? uMax, fr.leftMax ?? uMax);
+    setHp(foeHp, fr.rightHp ?? fMax, fr.rightMax ?? fMax);
+  }
 
   // Subtle flash on most frames, but skip on pause frames
   if(!a || a.kind !== 'pause'){
@@ -1008,21 +1028,32 @@ function renderFrame(i){
       pulse(atkSprite, a.attacker === 'L' ? 'attackUser' : 'attackFoe');
     }
 
-    if(a.kind === 'hit'){
-      // Turn-by-turn shake/flash on damage
+    if(a.kind === 'attack'){
+      // Pure animation beat (keeps the same text on-screen)
+      const atkSprite = a.attacker === 'L' ? userSprite : foeSprite;
+      pulse(atkSprite, a.attacker === 'L' ? 'attackUser' : 'attackFoe');
+      // Extra little motion so it's obvious a move is being performed
+      pulse(atkSprite, 'shake');
+    }
+
+    if(a.kind === 'impact'){
+      // Impact beat: defender shakes/flashes while HP ticks down.
       pulse(defSprite, 'shake');
       pulse(defSprite, 'hitFlash');
 
-      // Log details as a follow-up line
+      // Add a compact summary to the move log (damage + tags)
       const dmg = (a.damage != null) ? (' -' + a.damage) : '';
       let effTag = '';
       if(a.mult >= 4) effTag = ' (SUPER!)';
       else if(a.mult === 2) effTag = ' (SUPER)';
       else if(a.mult > 0 && a.mult <= 0.5) effTag = ' (RESIST)';
       const critTag = a.crit ? ' (CRIT)' : '';
-      pushMoveLine('↳' + dmg + effTag + critTag);
+      if(dmg) pushMoveLine('↳' + dmg + effTag + critTag);
+    }
 
-      // Type effectiveness popup (prioritize effectiveness over crit)
+    if(a.kind === 'hit'){
+      // These are "text beats" after the impact. We avoid re-shaking here so it feels like Pokémon.
+      // Still show popups for crit/effectiveness.
       if(a.mult >= 2) showPopup('SUPER EFFECTIVE!');
       else if(a.mult > 0 && a.mult <= 0.5) showPopup('NOT VERY EFFECTIVE…');
       else if(a.crit) showPopup('CRITICAL HIT!');
@@ -1049,9 +1080,9 @@ function scheduleNext(){
   }
   renderFrame(battleIndex);
   const fr = frames[battleIndex];
-  const ms = Math.max(250, Number(fr?.durationMs || 1000));
-  // Small gap between frames so the viewer perceives a clear back-and-forth "turn" rhythm.
-  const gap = 180;
+  const ms = Math.max(200, Number(fr?.durationMs || 1000));
+  // Tiny gap only (OBS timers can feel "sped up" if we add extra padding per frame).
+  const gap = 60;
   battleIndex++;
   battleTimer = setTimeout(scheduleNext, ms + gap);
 }

@@ -120,13 +120,15 @@ function simulateBattle(a, b, rng = defaultRng) {
    * Push an animation frame for the overlay.
    *
    * action: {
-   *   kind: 'start'|'sendout'|'use'|'hit'|'miss'|'noeffect'|'pause'|'faint'|'end',
+   *   kind: 'start'|'sendout'|'use'|'attack'|'impact'|'hit'|'miss'|'noeffect'|'pause'|'faint'|'end',
    *   attacker?: 'L'|'R',
    *   defender?: 'L'|'R',
    *   moveName?: string,
    *   damage?: number,
    *   crit?: boolean,
    *   mult?: number
+   *   hpFrom?: number,
+   *   hpTo?: number
    * }
    */
   function pushEvent(text, action, durationMs) {
@@ -144,8 +146,9 @@ function simulateBattle(a, b, rng = defaultRng) {
   // Opening sequence (lets overlay do "send out" animations)
   // Slightly slower pacing so OBS viewers can read each line.
   // A bit slower so the viewer can register the scene.
-  pushEvent(`A wild ${right.name} appeared!`, { kind: "start", defender: "R" }, 1600);
-  pushEvent(`Go! ${left.name}!`, { kind: "sendout", attacker: "L" }, 1600);
+  // Opening beats (enough time to read, like the mainline games).
+  pushEvent(`A wild ${right.name} appeared!`, { kind: "start", defender: "R" }, 1500);
+  pushEvent(`Go! ${left.name}!`, { kind: "sendout", attacker: "L" }, 1500);
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (left.hp <= 0 || right.hp <= 0) break;
@@ -174,44 +177,61 @@ function simulateBattle(a, b, rng = defaultRng) {
       if (att.hp <= 0 || def.hp <= 0) continue;
       if (!mv) continue;
 
-      // 1) "X used MOVE!"
-      // "X used MOVE!" gets its own beat, like the mainline games.
-      // Give the "used" line enough time to read.
-      pushEvent(`${att.name} used ${mv.name}!`, { kind: "use", attacker: attSide, defender: defSide, moveName: mv.name }, 1900);
+      // --- Mainline-style move sequence ---
+      // 1) Text: "X used MOVE!"
+      pushEvent(`${att.name} used ${mv.name}!`, { kind: "use", attacker: attSide, defender: defSide, moveName: mv.name }, 1600);
+      // 2) Small beat where the attacker "lunges" (no text change)
+      pushEvent(`${att.name} used ${mv.name}!`, { kind: "attack", attacker: attSide, defender: defSide, moveName: mv.name }, 500);
       if (turn <= 6) log.push(`${att.name} used ${mv.name}!`);
 
       const res = calcDamage({ attacker: att, defender: def, move: mv, rng });
 
       // 2) Outcome frame (damage/effectiveness/etc)
       if (!res.hit) {
-        pushEvent(`But it missed!`, { kind: "miss", attacker: attSide, defender: defSide, moveName: mv.name }, 1800);
+        pushEvent(`But it missed!`, { kind: "miss", attacker: attSide, defender: defSide, moveName: mv.name }, 1300);
         if (turn <= 6) log.push("But it missed!");
         continue;
       }
 
       if (res.mult === 0) {
-        pushEvent(`It had no effect!`, { kind: "noeffect", attacker: attSide, defender: defSide, moveName: mv.name, mult: 0 }, 1800);
+        pushEvent(`It had no effect!`, { kind: "noeffect", attacker: attSide, defender: defSide, moveName: mv.name, mult: 0 }, 1300);
         if (turn <= 6) log.push("It had no effect!");
         continue;
       }
 
-      def.hp = Math.max(0, def.hp - res.damage);
+      // 3) Impact beat: defender shakes/flashes and HP ticks down.
+      const hpBefore = def.hp;
+      const hpAfter = Math.max(0, def.hp - res.damage);
+      def.hp = hpAfter;
+      pushEvent("", { kind: "impact", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult, hpFrom: hpBefore, hpTo: hpAfter }, 520);
 
-      const lines = [];
-      lines.push(`-${res.damage} HP!`);
-      if (res.crit) lines.push("A critical hit!");
-      if (res.mult >= 2) lines.push("It's super effective!");
-      else if (res.mult > 0 && res.mult <= 0.5) lines.push("It's not very effective…");
+      // 4) Text beat: show damage as a separate line (you asked to show damage done)
+      pushEvent(`It dealt ${res.damage} damage!`, { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult }, 1300);
 
-      // Separate outcome beat: damage + crit/effectiveness + HP bar ticks down.
-      pushEvent(lines.join("\n"), { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult }, 1900);
-      if (turn <= 6) log.push(lines.join(" "));
+      // 5) Crit / effectiveness as their own lines, like the games
+      if (res.crit) {
+        pushEvent("A critical hit!", { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: true, mult: res.mult }, 1100);
+      }
+      if (res.mult >= 2) {
+        pushEvent("It's super effective!", { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult }, 1200);
+      } else if (res.mult > 0 && res.mult <= 0.5) {
+        pushEvent("It's not very effective…", { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult }, 1200);
+      }
+
+      // Keep the move log concise but useful
+      if (turn <= 6) {
+        let eff = "";
+        if (res.mult >= 2) eff = " (SUPER)";
+        else if (res.mult > 0 && res.mult <= 0.5) eff = " (RESIST)";
+        const crit = res.crit ? " (CRIT)" : "";
+        log.push(`${mv.name}: -${res.damage}${eff}${crit}`);
+      }
 
       // Tiny pause before KO/final texts (feels more like Pokémon)
       if (def.hp <= 0) {
         // A tiny breath before the KO text.
-        pushEvent("", { kind: "pause" }, 900);
-        pushEvent(`${def.name} fainted!`, { kind: "faint", attacker: attSide, defender: defSide }, 1800);
+        pushEvent("", { kind: "pause" }, 650);
+        pushEvent(`${def.name} fainted!`, { kind: "faint", attacker: attSide, defender: defSide }, 1400);
         break;
       }
     }
@@ -224,8 +244,8 @@ function simulateBattle(a, b, rng = defaultRng) {
     : "right";
 
   // Small pause before the win text
-  pushEvent("", { kind: "pause" }, 900);
-  pushEvent(winner === "left" ? `${left.name} wins!` : `${right.name} wins!`, { kind: "end" }, 2000);
+  pushEvent("", { kind: "pause" }, 650);
+  pushEvent(winner === "left" ? `${left.name} wins!` : `${right.name} wins!`, { kind: "end" }, 1400);
 
   return {
     winner,
