@@ -48,6 +48,10 @@ let BOOT_ERROR = null;
 // ---- Overlay (OBS Browser Source) ----
 let overlayWss = null;
 let overlayLastSpawn = null;
+// In-memory overlay event queue (WebSocket + polling fallback)
+let overlaySeq = 0;
+const overlayQueue = [];
+const OVERLAY_QUEUE_MAX = 40;
 
 // Overlay sound settings (stored in Prisma Setting table)
 function soundKey(streamer, part) {
@@ -196,13 +200,31 @@ function overlayEventFromSpawn(spawn) {
 
 function overlayBroadcast(event) {
   try {
+    // Stamp event with a monotonic id so the overlay can poll reliably.
+    // We still send over WebSocket when available.
+    overlaySeq += 1;
+    const stamped = Object.assign({ _id: overlaySeq }, event || {});
+    overlayQueue.push(stamped);
+    while (overlayQueue.length > OVERLAY_QUEUE_MAX) overlayQueue.shift();
+
     if (!overlayWss) return;
-    const payload = JSON.stringify(event);
+    const payload = JSON.stringify(stamped);
     for (const client of overlayWss.clients) {
       if (client.readyState === 1) client.send(payload);
     }
   } catch {}
 }
+
+// Polling fallback for OBS browser sources where WS upgrades might be blocked.
+app.get('/overlay/poll', (req, res) => {
+  try {
+    const since = Number(req.query.since || 0);
+    const evs = overlayQueue.filter(e => (Number(e?._id) || 0) > since);
+    res.json({ ok: true, now: overlaySeq, events: evs });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
 
 app.get("/", (req, res) => res.status(200).send("ok"));
 
@@ -975,6 +997,7 @@ app.get("/overlay", (req, res) => {
 
       renderFrame(0);
 
+      // 1 second per frame to feel like classic turn-by-turn battles
       battleTimer = setInterval(()=>{
         battleIndex++;
         if(battleIndex >= frames.length){
@@ -984,7 +1007,7 @@ app.get("/overlay", (req, res) => {
           return;
         }
         renderFrame(battleIndex);
-      }, 650);
+      }, 1000);
     }
 
 
@@ -1012,11 +1035,14 @@ app.get("/overlay", (req, res) => {
     // Optional UI slider (if ?ui=1)
     if(uiSlider){ uiSlider.oninput = ()=>{ setVol(Number(uiSlider.value)/100); }; }
 
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(proto + '://' + location.host + '/overlay/ws');
-    ws.onmessage = (e)=>{
+    // --- Overlay event transport ---
+    // Prefer WebSocket, but fall back to polling (some OBS environments block WS upgrades).
+    let lastId = 0;
+    let pollTimer = null;
+
+    function handleOverlayMsg(msg){
       try{
-        const msg = JSON.parse(e.data);
+        if(msg && msg._id) lastId = Math.max(lastId, Number(msg._id) || 0);
         if(msg.type === "spawn") { hideBattle(); show(msg.spawn); }
         if(msg.type === "battle" && msg.battle) playBattle(msg.battle);
         if(msg.type === "clear") { hideBattle(); clear(); }
@@ -1024,7 +1050,41 @@ app.get("/overlay", (req, res) => {
         if(msg.type === "caught") caught(msg.trainer || "Someone", msg.pokemon || "a Pokémon", !!msg.isShiny);
         if(msg.type === "sound_settings" && msg.settings){ setEnabled(msg.settings.enabled); setVol(msg.settings.volume); }
       }catch{}
-    };
+    }
+
+    async function poll(){
+      try{
+        const r = await fetch('/overlay/poll?since=' + encodeURIComponent(String(lastId)));
+        const j = await r.json();
+        const evs = Array.isArray(j?.events) ? j.events : [];
+        for(const ev of evs) handleOverlayMsg(ev);
+      }catch{}
+    }
+
+    function startPolling(){
+      if(pollTimer) return;
+      poll();
+      pollTimer = setInterval(poll, 500);
+    }
+
+    function stopPolling(){
+      if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    try{
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(proto + '://' + location.host + '/overlay/ws');
+      ws.onopen = ()=>{ stopPolling(); };
+      ws.onmessage = (e)=>{
+        try{ handleOverlayMsg(JSON.parse(e.data)); }catch{}
+      };
+      ws.onerror = ()=>{ startPolling(); };
+      ws.onclose = ()=>{ startPolling(); };
+      // If WS doesn't connect quickly, start polling anyway.
+      setTimeout(()=>{ try{ if(ws.readyState !== 1) startPolling(); }catch{} }, 1200);
+    }catch{
+      startPolling();
+    }
   </script>
 </body>
 </html>`;
@@ -1274,29 +1334,10 @@ async function handleChat({ username, userId, content }) {
     const shinyTag = s.isShiny ? " ✨SHINY✨" : "";
     const lvlTag = s.level ? `Lv. ${s.level} ` : "";
 
-    if (result.result === "lost") {
-      const logLine = (result.log || []).slice(0, 3).join(" ");
-      try {
-        await refreshKickTokenIfNeeded();
-        await sendKickChatMessage(
-          `⚔️ ${username}'s ${result.userMon.name} lost to ${lvlTag}${s.pokemon}${shinyTag}. ${logLine}`.trim()
-        );
-      } catch {}
-      return;
-    }
-
-    // won -> guaranteed catch already recorded
-    const logLine = (result.log || []).slice(0, 3).join(" ");
+    // Notify overlay: play battle animation.
     try {
-      await refreshKickTokenIfNeeded();
-      await sendKickChatMessage(
-        `🏁 ${username}'s ${result.userMon.name} defeated ${lvlTag}${s.pokemon}${shinyTag}! Caught for ${result.catch.pointsEarned} pts. ${logLine}`.trim()
-      );
-    } catch {}
-
-    // Notify overlay: play battle animation, then show caught/clear if won
-    try {
-      const frames = (result.events || result.simEvents || result.frames || []).slice(0, 18);
+      const framesAll = (result.events || result.simEvents || result.frames || []);
+      const frames = framesAll.slice(0, 40); // cap to keep overlay snappy
       overlayBroadcast({
         type: "battle",
         battle: {
@@ -1318,32 +1359,61 @@ async function handleChat({ username, userId, content }) {
           frames
         }
       });
-
-      // If the user won, delay the caught flash until after the battle animation
-      if (result.result === "won") {
-        setTimeout(() => {
-          try {
-            overlayBroadcast({
-              type: "caught",
-              spawnId: s.id,
-              trainer: username,
-              pokemon: s.pokemon,
-              isShiny: !!s.isShiny,
-              sprite: spriteUrlForSpawn(s)
-            });
-            overlayBroadcast({ type: "clear" });
-            overlayLastSpawn = null;
-          } catch {}
-        }, 6500);
-      } else {
-        // Lost: return to spawn card after animation
-        setTimeout(() => {
-          try {
-            overlayBroadcast(overlayEventFromSpawn(overlayLastSpawn));
-          } catch {}
-        }, 6500);
-      }
     } catch {}
+
+    // --- Turn-by-turn chat playback (so chat matches overlay pacing) ---
+    // We keep this concise to avoid flooding chat: up to 6 turn lines + final.
+    const evs = Array.isArray(result.events) ? result.events : [];
+    const turnLines = evs
+      .filter(e => e && typeof e.text === 'string' && e.text.trim())
+      .map(e => e.text.trim())
+      .slice(0, 7); // include start + a few turns
+
+    const battleMs = Math.min(12000, Math.max(2500, (Math.min(40, evs.length || 0) * 1000) + 600));
+
+    try {
+      await refreshKickTokenIfNeeded();
+      await sendKickChatMessage(`⚔️ ${username} sent out ${result.userMon.name} vs ${lvlTag}${s.pokemon}${shinyTag}!`.trim());
+    } catch {}
+
+    // Playback 1 line per second (skip the first event line if it's redundant)
+    const playback = turnLines.slice(0, 6);
+    for (let i = 0; i < playback.length; i++) {
+      setTimeout(async () => {
+        try { await sendKickChatMessage(playback[i]); } catch {}
+      }, 1000 * (i + 1));
+    }
+
+    // Final result at the end
+    setTimeout(async () => {
+      try {
+        if (result.result === 'lost') {
+          await sendKickChatMessage(`💥 ${username}'s ${result.userMon.name} lost to ${lvlTag}${s.pokemon}${shinyTag}.`.trim());
+        } else {
+          await sendKickChatMessage(`🏁 ${username}'s ${result.userMon.name} defeated ${lvlTag}${s.pokemon}${shinyTag}! Caught for ${result.catch.pointsEarned} pts.`.trim());
+        }
+      } catch {}
+    }, battleMs);
+
+    // If the user won, delay the caught flash until after the battle animation
+    setTimeout(() => {
+      try {
+        if (result.result === "won") {
+          overlayBroadcast({
+            type: "caught",
+            spawnId: s.id,
+            trainer: username,
+            pokemon: s.pokemon,
+            isShiny: !!s.isShiny,
+            sprite: spriteUrlForSpawn(s)
+          });
+          overlayBroadcast({ type: "clear" });
+          overlayLastSpawn = null;
+        } else {
+          overlayBroadcast(overlayEventFromSpawn(overlayLastSpawn));
+        }
+      } catch {}
+    }, battleMs);
 
     return;
   }
