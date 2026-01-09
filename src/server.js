@@ -685,17 +685,24 @@ app.get("/overlay", (req, res) => {
     let soundEnabled = true;
     let targetVolume = 0.5;
 
-    // WebAudio for smooth fade-out
-    let ctx = null, src = null, gain = null;
-    function ensureAudioGraph(){
-      if(ctx) return;
+    // ---- Audio ----
+    // OBS Browser Source runs on CEF; autoplay can be blocked until a user interaction.
+    // We "prime" audio by attempting a muted play on load (muted autoplay is usually allowed),
+    // then we unmute + play when a Pokémon spawns or the user clicks unlock.
+    let primed = false;
+    async function primeAudio(){
+      if(primed) return true;
       try{
-        ctx = new (window.AudioContext || window.webkitAudioContext)();
-        src = ctx.createMediaElementSource(audioEl);
-        gain = ctx.createGain();
-        gain.gain.value = targetVolume;
-        src.connect(gain).connect(ctx.destination);
-      }catch(e){ ctx=null; }
+        audioEl.muted = true;
+        audioEl.volume = 0;
+        await audioEl.play();
+        // tiny delay so the play() actually starts before we pause
+        setTimeout(()=>{ try{ audioEl.pause(); audioEl.currentTime = 0; }catch{} }, 50);
+        primed = true;
+        return true;
+      }catch(e){
+        return false;
+      }
     }
 
     function setVol(v){
@@ -714,35 +721,47 @@ app.get("/overlay", (req, res) => {
     }
 
     async function startLoop(){
-      if(!soundEnabled) return;
-      try{ ensureAudioGraph(); if(ctx && ctx.state==="suspended") await ctx.resume(); }catch{}
-      try{
-        audioEl.currentTime = 0;
-        audioEl.volume = targetVolume;
-        if(gain && ctx){ gain.gain.cancelScheduledValues(ctx.currentTime); gain.gain.setValueAtTime(targetVolume, ctx.currentTime); }
-        await audioEl.play();
-        if(unlockBtn) unlockBtn.style.display = "none";
-      }catch(e){
-        if(unlockBtn) unlockBtn.style.display = "block";
+  if(!soundEnabled) return;
+  // Try playing normally first. If blocked, show unlock.
+  try{
+    // If we primed earlier, ensure we're unmuted and audible now.
+    audioEl.muted = false;
+    audioEl.volume = targetVolume;
+    audioEl.currentTime = 0;
+    await audioEl.play();
+    if(unlockBtn) unlockBtn.style.display = "none";
+  }catch(e){
+    // Attempt to prime (muted autoplay), then require explicit click to unmute.
+    await primeAudio();
+    if(unlockBtn) unlockBtn.style.display = "block";
+  }
+}
+
+function fadeOutAndStop(ms){
+  try{
+    const start = audioEl.volume;
+    const steps = 12;
+    let i = 0;
+    const stepMs = Math.max(16, Math.floor(ms/steps));
+    const int = setInterval(()=>{
+      i++;
+      const v = Math.max(0, start*(1 - i/steps));
+      audioEl.volume = v;
+      if(i >= steps){
+        clearInterval(int);
+        try{ audioEl.pause(); audioEl.currentTime = 0; }catch{}
+        audioEl.muted = true; // keep muted so future prime attempts are allowed
+        audioEl.volume = 0;
+        // restore "intended" volume for next startLoop
+        setTimeout(()=>{ try{ audioEl.muted = false; audioEl.volume = targetVolume; }catch{} }, 0);
       }
-    }
+    }, stepMs);
+  }catch(e){
+    try{ audioEl.pause(); audioEl.currentTime=0; }catch{}
+  }
+}
 
-    function fadeOutAndStop(ms){
-      try{
-        if(gain && ctx){
-          const t = ctx.currentTime;
-          gain.gain.cancelScheduledValues(t);
-          gain.gain.setValueAtTime(gain.gain.value, t);
-          gain.gain.linearRampToValueAtTime(0.0001, t + (ms/1000));
-          setTimeout(()=>{ try{ audioEl.pause(); audioEl.currentTime = 0; gain.gain.setValueAtTime(targetVolume, ctx.currentTime);}catch{} }, ms+40);
-        } else {
-          const start = audioEl.volume; const steps = 10; let i=0;
-          const int = setInterval(()=>{ i++; audioEl.volume = Math.max(0, start*(1-i/steps)); if(i>=steps){ clearInterval(int); audioEl.pause(); audioEl.currentTime=0; audioEl.volume=targetVolume;} }, Math.max(16, Math.floor(ms/steps)));
-        }
-      }catch(e){ try{ audioEl.pause(); audioEl.currentTime=0; }catch{} }
-    }
-
-    function show(spawn){
+function show(spawn){
       if(!spawn || !spawn.sprite) return;
       currentSpawn = spawn;
       sprite.src = spawn.sprite;
@@ -771,15 +790,32 @@ app.get("/overlay", (req, res) => {
     }
     tickBar();
 
-    // unlock audio via click
-    if(unlockBtn){
-      unlockBtn.addEventListener("click", async ()=>{
-        try{ ensureAudioGraph(); if(ctx && ctx.state==="suspended") await ctx.resume(); }catch{}
-        startLoop();
-      });
-    }
+    // unlock audio via click (requires OBS "Interact" to click the browser source)
+async function unlockAndPlay(){
+  try{ await primeAudio(); }catch{}
+  try{
+    audioEl.muted = false;
+    audioEl.volume = targetVolume;
+    audioEl.currentTime = 0;
+    await audioEl.play();
+    if(unlockBtn) unlockBtn.style.display = "none";
+  }catch(e){
+    if(unlockBtn) unlockBtn.style.display = "block";
+  }
+}
 
-    // Optional UI slider (if ?ui=1)
+if(unlockBtn){
+  unlockBtn.addEventListener("click", unlockAndPlay);
+}
+// Also treat any click on the overlay as an unlock gesture (helpful in OBS).
+document.addEventListener("click", ()=>{
+  if(unlockBtn && unlockBtn.style.display !== "none") unlockAndPlay();
+}, { passive:true });
+
+// Prime audio on load (muted autoplay)
+setTimeout(()=>{ primeAudio(); }, 0);
+
+// Optional UI slider (if ?ui=1) (if ?ui=1)
     if(uiSlider){ uiSlider.oninput = ()=>{ setVol(Number(uiSlider.value)/100); }; }
 
     const proto = location.protocol === "https:" ? "wss" : "ws";
