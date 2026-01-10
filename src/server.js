@@ -343,7 +343,33 @@ function ensureDbSchema() {
       return;
     }
 
-    throw e;
+    // If we got here, migrate deploy failed for a reason other than "no migrations".
+    // Do NOT crash the whole bot; we'll attempt to boot anyway and rely on
+    // best-effort SQL "ensure" statements for any optional columns.
+    console.warn("⚠️ prisma migrate deploy failed; continuing boot anyway. Some features may not work until schema is applied.");
+    return;
+  }
+}
+
+// ---------- Best-effort schema safety net (no Prisma CLI required) ----------
+// Railway/production sometimes boots without running Prisma CLI successfully.
+// These ALTER TABLE statements are safe (IF NOT EXISTS) and make sure optional
+// columns used by newer features exist.
+async function ensureOptionalColumns() {
+  try {
+    // Catch: persistent HP + optional level
+    await prisma.$executeRawUnsafe('ALTER TABLE "Catch" ADD COLUMN IF NOT EXISTS "level" integer');
+    await prisma.$executeRawUnsafe('ALTER TABLE "Catch" ADD COLUMN IF NOT EXISTS "hpMax" integer');
+    await prisma.$executeRawUnsafe('ALTER TABLE "Catch" ADD COLUMN IF NOT EXISTS "hpCurrent" integer');
+
+    // Spawn: stable dex id + battle stats/moves caching
+    await prisma.$executeRawUnsafe('ALTER TABLE "Spawn" ADD COLUMN IF NOT EXISTS "pokemonId" text');
+    await prisma.$executeRawUnsafe('ALTER TABLE "Spawn" ADD COLUMN IF NOT EXISTS "level" integer NOT NULL DEFAULT 5');
+    await prisma.$executeRawUnsafe('ALTER TABLE "Spawn" ADD COLUMN IF NOT EXISTS "catchRate" integer NOT NULL DEFAULT 45');
+    await prisma.$executeRawUnsafe('ALTER TABLE "Spawn" ADD COLUMN IF NOT EXISTS "statsJson" jsonb');
+    await prisma.$executeRawUnsafe('ALTER TABLE "Spawn" ADD COLUMN IF NOT EXISTS "movesJson" jsonb');
+  } catch (e) {
+    console.warn("⚠️ ensureOptionalColumns failed (continuing):", e?.message || e);
   }
 }
 
@@ -2117,6 +2143,9 @@ const server = app.listen(PORT, () => {
     try {
       ensureDbSchema();
       await prisma.$queryRaw`SELECT 1`;
+
+      // Safety net: ensure optional columns exist even if Prisma CLI didn't run.
+      await ensureOptionalColumns();
 
       await migrateLegacyKickTokens();
 
