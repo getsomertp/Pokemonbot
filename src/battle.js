@@ -176,8 +176,12 @@ function simulateBattle(a, b, rng = defaultRng, opts = {}) {
   const right = JSON.parse(JSON.stringify(b));
   left.maxHP = Number(left.stats?.hp || 1);
   right.maxHP = Number(right.stats?.hp || 1);
-  left.hp = left.maxHP;
-  right.hp = right.maxHP;
+
+  // If caller provided a starting HP (for persistent HP between battles), respect it.
+  const lh = Number(left.hp);
+  const rh = Number(right.hp);
+  left.hp = Number.isFinite(lh) ? Math.max(0, Math.min(left.maxHP, Math.trunc(lh))) : left.maxHP;
+  right.hp = Number.isFinite(rh) ? Math.max(0, Math.min(right.maxHP, Math.trunc(rh))) : right.maxHP;
   left.status = left.status || null;
   right.status = right.status || null;
 

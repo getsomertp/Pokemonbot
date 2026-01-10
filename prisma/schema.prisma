@@ -78,6 +78,10 @@ model Catch {
   // NEW (optional but recommended): store the level that was caught
   level        Int?     
 
+  // Persistent HP between battles
+  maxHp       Int?
+  currentHp   Int?
+
   pointsEarned Int
   speedMs      Int
   caughtAt     DateTime @default(now())

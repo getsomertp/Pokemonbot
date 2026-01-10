@@ -663,6 +663,207 @@ app.get("/state", async (req, res) => {
 });
 
 // ---------- OBS Overlay ----------
+
+// ---- Trainer inventory page (public) ----
+const _dexForPages = (() => {
+  try { return dex.loadDex(); } catch { return null; }
+})();
+
+function _escHtml(s = "") {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function _tierRank(tier) {
+  switch (String(tier || "").toLowerCase()) {
+    case "legendary": return 5;
+    case "epic": return 4;
+    case "rare": return 3;
+    case "uncommon": return 2;
+    case "common": return 1;
+    default: return 0;
+  }
+}
+
+function _getDexEntryByName(name) {
+  const n = String(name || "").toLowerCase();
+  const data = _dexForPages;
+  if (!data?.pokemon?.length) return null;
+  // match on canonical name, else try id
+  return data.pokemon.find(p => String(p.name || "").toLowerCase() === n || String(p.id || "").toLowerCase() === n) || null;
+}
+
+function _officialArtworkUrl(dexNumber) {
+  const n = Number(dexNumber);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/${n}.png`;
+}
+
+app.get("/trainer/:username", async (req, res) => {
+  const handle = String(req.params.username || "").toLowerCase();
+
+  const ident = await prisma.userIdentity.findUnique({
+    where: { platform_handle: { platform: "kick", handle } },
+    include: { user: true }
+  });
+
+  if (!ident?.user) {
+    res.status(404).type("html").send("<h1 style=\"font-family:system-ui;padding:24px\">Trainer not found</h1>");
+    return;
+  }
+
+  const user = ident.user;
+
+  const shinyOnly = String(req.query.shiny || "").toLowerCase();
+  const rarity = String(req.query.rarity || "").toLowerCase();
+  const sort = String(req.query.sort || "recent").toLowerCase();
+
+  const page = Math.max(1, Number.parseInt(req.query.page || "1", 10) || 1);
+  const limit = Math.min(200, Math.max(20, Number.parseInt(req.query.limit || "100", 10) || 100));
+  const skip = (page - 1) * limit;
+
+  const where = { userId: user.id };
+  if (shinyOnly === "1" || shinyOnly === "true" || shinyOnly === "yes") where.isShiny = true;
+  if (rarity) where.tier = rarity;
+
+  const orderBy =
+    sort === "level"
+      ? [{ level: "desc" }, { caughtAt: "desc" }]
+      : sort === "pokemon"
+        ? [{ pokemon: "asc" }, { caughtAt: "desc" }]
+        : [{ caughtAt: "desc" }];
+
+  const [total, rows] = await Promise.all([
+    prisma.catch.count({ where }),
+    prisma.catch.findMany({ where, orderBy, skip, take: limit })
+  ]);
+
+  const totalPages = Math.max(1, Math.ceil(total / limit));
+
+  const chips = [];
+  if (where.isShiny) chips.push("✨ Shiny");
+  if (rarity) chips.push(`Rarity: ${rarity}`);
+  chips.push(`Sort: ${sort}`);
+
+  const buildQS = (patch) => {
+    const q = new URLSearchParams({
+      ...(shinyOnly ? { shiny: shinyOnly } : {}),
+      ...(rarity ? { rarity } : {}),
+      ...(sort ? { sort } : {}),
+      page: String(page),
+      limit: String(limit),
+      ...patch
+    });
+    // drop defaults
+    if (!q.get("shiny") || q.get("shiny") === "0" || q.get("shiny") === "false") q.delete("shiny");
+    if (!q.get("rarity")) q.delete("rarity");
+    if (!q.get("sort") || q.get("sort") === "recent") q.delete("sort");
+    if (q.get("page") === "1") q.delete("page");
+    if (q.get("limit") === "100") q.delete("limit");
+    return q.toString() ? `?${q.toString()}` : "";
+  };
+
+  const cards = rows.map((c) => {
+    const entry = _getDexEntryByName(c.pokemon);
+    const art = entry?.dex ? _officialArtworkUrl(entry.dex) : null;
+    const name = _escHtml(c.pokemon);
+    const lvl = c.level ?? "?";
+    const tier = _escHtml(c.tier || "");
+    const shiny = c.isShiny ? "✨" : "";
+    const caught = c.caughtAt ? new Date(c.caughtAt).toISOString().slice(0, 10) : "";
+    return `
+      <div class="card">
+        <div class="art">${art ? `<img loading="lazy" src="${art}" alt="${name}"/>` : `<div class="noart">?</div>`}</div>
+        <div class="info">
+          <div class="title">${shiny} ${name}</div>
+          <div class="meta">Lv ${lvl} • HP ${(c.currentHp ?? c.maxHp) != null ? String(c.currentHp ?? c.maxHp) + "/" + String(c.maxHp ?? c.currentHp) : "—"} • ${tier || "—"} • ${caught}</div>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const prevHref = page > 1 ? `/trainer/${handle}${buildQS({ page: String(page - 1) })}` : null;
+  const nextHref = page < totalPages ? `/trainer/${handle}${buildQS({ page: String(page + 1) })}` : null;
+
+  res.status(200).type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>${_escHtml(user.displayName || handle)} — Pokémon</title>
+  <style>
+    :root{color-scheme:dark}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#0b0f14;color:#e8eef6}
+    a{color:#9ad0ff;text-decoration:none}
+    a:hover{text-decoration:underline}
+    .wrap{max-width:1040px;margin:0 auto;padding:22px}
+    h1{margin:0 0 6px;font-size:22px}
+    .sub{opacity:.78;margin-bottom:14px}
+    .bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:14px 0 16px}
+    .pill{display:inline-flex;gap:8px;align-items:center;border:1px solid #1f2a3a;background:#121926;border-radius:999px;padding:8px 12px;font-size:13px;opacity:.92}
+    .pill b{font-weight:700}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+    .card{display:flex;gap:12px;align-items:center;background:#121926;border:1px solid #1f2a3a;border-radius:16px;padding:10px}
+    .art{width:64px;height:64px;display:grid;place-items:center;border-radius:14px;background:#0f1520;border:1px solid #1f2a3a;overflow:hidden}
+    .art img{width:64px;height:64px;object-fit:contain}
+    .noart{opacity:.45;font-weight:800}
+    .title{font-weight:800}
+    .meta{opacity:.78;font-size:12.5px;margin-top:3px}
+    .controls{display:flex;flex-wrap:wrap;gap:8px}
+    .btn{border:1px solid #1f2a3a;background:#0f1520;border-radius:12px;padding:8px 10px;font-size:13px}
+    .btn.on{background:#162338}
+    .pager{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-top:16px}
+    .muted{opacity:.75}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>${_escHtml(user.displayName || handle)}’s Pokémon</h1>
+    <div class="sub">Total: ${total} • Showing ${rows.length} (page ${page}/${totalPages})</div>
+
+    <div class="bar">
+      <span class="pill"><b>Filters</b> ${chips.map(_escHtml).join(" • ")}</span>
+      <div class="controls">
+        <a class="btn ${where.isShiny ? "on" : ""}" href="/trainer/${handle}${buildQS({ shiny: where.isShiny ? "" : "1", page: "1" })}">✨ Shiny</a>
+        <a class="btn ${rarity === "legendary" ? "on" : ""}" href="/trainer/${handle}${buildQS({ rarity: rarity === "legendary" ? "" : "legendary", page: "1" })}">Legendary</a>
+        <a class="btn ${rarity === "epic" ? "on" : ""}" href="/trainer/${handle}${buildQS({ rarity: rarity === "epic" ? "" : "epic", page: "1" })}">Epic</a>
+        <a class="btn ${rarity === "rare" ? "on" : ""}" href="/trainer/${handle}${buildQS({ rarity: rarity === "rare" ? "" : "rare", page: "1" })}">Rare</a>
+        <a class="btn ${rarity === "uncommon" ? "on" : ""}" href="/trainer/${handle}${buildQS({ rarity: rarity === "uncommon" ? "" : "uncommon", page: "1" })}">Uncommon</a>
+        <a class="btn ${rarity === "common" ? "on" : ""}" href="/trainer/${handle}${buildQS({ rarity: rarity === "common" ? "" : "common", page: "1" })}">Common</a>
+      </div>
+    </div>
+
+    <div class="bar">
+      <span class="pill"><b>Sort</b></span>
+      <div class="controls">
+        <a class="btn ${sort === "recent" ? "on" : ""}" href="/trainer/${handle}${buildQS({ sort: "recent", page: "1" })}">Recent</a>
+        <a class="btn ${sort === "level" ? "on" : ""}" href="/trainer/${handle}${buildQS({ sort: "level", page: "1" })}">Level</a>
+        <a class="btn ${sort === "pokemon" ? "on" : ""}" href="/trainer/${handle}${buildQS({ sort: "pokemon", page: "1" })}">Name</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      ${cards || '<div class="muted">No Pokémon match these filters.</div>'}
+    </div>
+
+    <div class="pager">
+      <div class="muted">Tip: add <code>?shiny=1</code>, <code>?rarity=legendary</code>, <code>?sort=level</code></div>
+      <div>
+        ${prevHref ? `<a class="btn" href="${prevHref}">← Prev</a>` : `<span class="btn muted">← Prev</span>`}
+        <span class="btn muted">Page ${page}/${totalPages}</span>
+        ${nextHref ? `<a class="btn" href="${nextHref}">Next →</a>` : `<span class="btn muted">Next →</span>`}
+      </div>
+    </div>
+  </div>
+</body>
+</html>`);
+});
+
+
 app.get("/overlay", (req, res) => {
   const showUi = String(req.query.ui || "") === "1";
   const html = `<!doctype html>
@@ -1457,6 +1658,26 @@ async function handleChat({ username, userId, content }) {
   lastCommandAt.set(cdKey, now);
 
   const lower = msg.toLowerCase();
+
+  // !pokehelp (player command list)
+  if (lower === `${PREFIX}pokehelp` || lower === `${PREFIX}help` || lower === `${PREFIX}commands`) {
+    try {
+      await refreshKickTokenIfNeeded();
+
+      // Keep messages short to avoid spam / truncation.
+      await sendKickChatMessage(
+        `📘 PokeHelp — Core: ${PREFIX}catch | ${PREFIX}battle | ${PREFIX}duel | ${PREFIX}use <pokemon> | ${PREFIX}heal [pokemon] (250 LP)`
+      );
+      await sendKickChatMessage(
+        `📦 Info: ${PREFIX}inv | ${PREFIX}top | ${PREFIX}pokedex | ${PREFIX}bet <amount> | ${PREFIX}pokehelp`
+      );
+      await sendKickChatMessage(
+        `⚔️ Duels: ${PREFIX}duel @user → ${PREFIX}accept / ${PREFIX}decline (queued so battles finish first)`
+      );
+    } catch {}
+    return;
+  }
+
   // !catch  (optional: !catch <name>)
   if (lower === `${PREFIX}catch` || lower.startsWith(`${PREFIX}catch `)) {
     const guess = lower === `${PREFIX}catch` ? "" : msg.slice(`${PREFIX}catch `.length);
@@ -1615,14 +1836,74 @@ async function handleChat({ username, userId, content }) {
     const list = recent
       .map((c) => `${c.isShiny ? "✨" : ""}${c.pokemon}${c.level ? " Lv." + c.level : ""}`)
       .join(", ");
+    const baseUrl = process.env.PUBLIC_BASE_URL;
+    const invLink = baseUrl ? `${baseUrl.replace(/\/$/, "")}/trainer/${String(username).toLowerCase()}` : null;
     try {
       await refreshKickTokenIfNeeded();
-      await sendKickChatMessage(`🎒 ${username} — LeaderPts: ${leaderPts} | Recent: ${list}`);
+      await sendKickChatMessage(`🎒 ${username} — LeaderPts: ${leaderPts} | Recent: ${list}${invLink ? " | Full: " + invLink : ""}`);
     } catch {}
     return;
   }
 
-  // !use <pokemon>  (sets your active battle Pokémon; picks your highest level of that species)
+  
+// !heal [pokemon]  (spend LeaderPoints to heal a Pokémon to full; HP persists between battles)
+if (lower === `${PREFIX}heal` || lower.startsWith(`${PREFIX}heal `)) {
+  const arg = msg.split(/\s+/).slice(1).join(" ").trim();
+  const user = await game.getOrCreateKickUser(username, userId);
+
+  const cost = envInt("HEAL_COST_LP", 250);
+  const leaderPts = await getLeaderPoints(user.id);
+  if (leaderPts < cost) {
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`🧪 ${username} — you need ${cost} LeaderPts to heal (you have ${leaderPts}).`); } catch {}
+    return;
+  }
+
+  // Pick target Pokémon instance to heal:
+  // - If arg provided: heal your highest level of that species (or by catch id if you paste it)
+  // - Otherwise: heal your currently selected battle Pokémon (via !use), or your highest level catch
+  let target = null;
+  if (arg) {
+    const rows = await prisma.catch.findMany({
+      where: { userId: user.id },
+      orderBy: [{ level: "desc" }, { caughtAt: "desc" }],
+      take: 200
+    });
+    const a = arg.toLowerCase();
+    target = rows.find((r) => String(r.id).toLowerCase() === a) ||
+             rows.find((r) => String(r.pokemon || "").toLowerCase() === a) ||
+             null;
+  } else {
+    const sel = await game.getUserBattleMon(user.id);
+    target = sel?.catchRow || null;
+  }
+
+  if (!target) {
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`🧪 ${username} — you don't have any Pokémon to heal yet.`); } catch {}
+    return;
+  }
+
+  const maxHp = Number(target.maxHp || 0);
+  if (!Number.isFinite(maxHp) || maxHp <= 0) {
+    // Backfill max HP if older catches existed before HP persistence was added
+    const rebuilt = require("./battle").buildBattleMonFromDex({ nameOrId: target.pokemon, level: target.level || 5 });
+    const mhp = Number(rebuilt?.stats?.hp || 1);
+    await prisma.catch.update({ where: { id: target.id }, data: { maxHp: mhp, currentHp: mhp } }).catch(() => {});
+  } else {
+    await prisma.catch.update({ where: { id: target.id }, data: { currentHp: maxHp } }).catch(() => {});
+  }
+
+  // Deduct currency via adjustment
+  const adj = await getLpAdj(user.id);
+  await setLpAdj(user.id, adj - cost);
+
+  try {
+    await refreshKickTokenIfNeeded();
+    await sendKickChatMessage(`💚 ${username} healed ${target.isShiny ? "✨" : ""}${target.pokemon}${target.level ? " Lv." + target.level : ""} to full for ${cost} LeaderPts!`);
+  } catch {}
+  return;
+}
+
+// !use <pokemon>  (sets your active battle Pokémon; picks your highest level of that species)
   if (lower === `${PREFIX}use` || lower.startsWith(`${PREFIX}use `) || lower === `${PREFIX}pick` || lower.startsWith(`${PREFIX}pick `)) {
     const arg = msg.split(/\s+/).slice(1).join(" ").trim();
     const user = await game.getOrCreateKickUser(username, userId);
