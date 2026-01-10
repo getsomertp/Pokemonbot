@@ -166,7 +166,12 @@ function chooseMove(poke, rng) {
  * @param {object} b - same shape
  * @param {function} rng - () => number in [0,1)
  */
-function simulateBattle(a, b, rng = defaultRng) {
+function simulateBattle(a, b, rng = defaultRng, opts = {}) {
+  // Back-compat: allow simulateBattle(a, b, opts)
+  if (rng && typeof rng === "object" && !Array.isArray(rng) && (opts == null || (typeof opts === "object" && Object.keys(opts).length === 0))) {
+    opts = rng;
+    rng = defaultRng;
+  }
   const left = JSON.parse(JSON.stringify(a));
   const right = JSON.parse(JSON.stringify(b));
   left.maxHP = Number(left.stats?.hp || 1);
@@ -207,12 +212,22 @@ function simulateBattle(a, b, rng = defaultRng) {
     });
   }
 
-  // Opening sequence (lets overlay do "send out" animations)
-  // Slightly slower pacing so OBS viewers can read each line.
-  // A bit slower so the viewer can register the scene.
-  // Opening beats (enough time to read, like the mainline games).
-  pushEvent(`A wild ${right.name} appeared!`, { kind: "start", defender: "R" }, 1500);
-  pushEvent(`Go! ${left.name}!`, { kind: "sendout", attacker: "L" }, 1500);
+  // --- Opening sequence (wild vs trainer) ---
+  const mode = String(opts?.mode || "wild").toLowerCase();
+  const leftTrainer = opts?.leftTrainerName ? String(opts.leftTrainerName) : null;
+  const rightTrainer = opts?.rightTrainerName ? String(opts.rightTrainerName) : null;
+
+  if (mode === "trainer") {
+    const aName = leftTrainer || "Trainer";
+    const bName = rightTrainer || "Trainer";
+    pushEvent(`${aName} challenges ${bName}!`, { kind: "trainer_intro" }, 1600);
+    // Foe sends out first (classic pacing)
+    pushEvent(`${bName} sent out ${right.name}!`, { kind: "start", attacker: "R", defender: "L" }, 1500);
+    pushEvent(`Go! ${left.name}!`, { kind: "sendout", attacker: "L" }, 1500);
+  } else {
+    pushEvent(`A wild ${right.name} appeared!`, { kind: "start", defender: "R" }, 1500);
+    pushEvent(`Go! ${left.name}!`, { kind: "sendout", attacker: "L" }, 1500);
+  }
 
   // --- Turn order ---
   // Viewers expect an obvious back-and-forth: X attacks, then Y attacks, etc.
@@ -220,7 +235,17 @@ function simulateBattle(a, b, rng = defaultRng) {
   // (This prevents the battle from *feeling* like one side is taking multiple turns.)
   const lSpe0 = Number(left.stats?.spe ?? left.stats?.speed ?? left.stats?.spd ?? 1);
   const rSpe0 = Number(right.stats?.spe ?? right.stats?.speed ?? right.stats?.spd ?? 1);
-  const starter = lSpe0 !== rSpe0 ? (lSpe0 > rSpe0 ? "L" : "R") : (rng() < 0.5 ? "L" : "R");
+
+  // Speed tie breaker (quick little beat so viewers understand why someone goes first)
+  let starter;
+  if (lSpe0 !== rSpe0) {
+    starter = lSpe0 > rSpe0 ? "L" : "R";
+  } else {
+    pushEvent("Speed tie!", { kind: "speed_tie" }, 900);
+    starter = rng() < 0.5 ? "L" : "R";
+    const firstName = starter === "L" ? left.name : right.name;
+    pushEvent(`${firstName} goes first!`, { kind: "speed_result", winner: starter }, 1000);
+  }
   const other = starter === "L" ? "R" : "L";
 
   for (let turn = 1; turn <= maxTurns; turn++) {
@@ -259,14 +284,18 @@ function simulateBattle(a, b, rng = defaultRng) {
         continue;
       }
 
-      // 3) Impact beat: defender shakes/flashes and HP ticks down.
+      // Apply damage to state immediately (so future frames snapshot correctly),
+      // but animate the HP bar after the "damage" text for clearer pacing:
+      // Used MOVE -> Damage line -> HP bar drop.
       const hpBefore = def.hp;
       const hpAfter = Math.max(0, def.hp - res.damage);
       def.hp = hpAfter;
-      pushEvent("", { kind: "impact", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult, hpFrom: hpBefore, hpTo: hpAfter }, 520);
 
-      // 4) Text beat: show damage as a separate line (you asked to show damage done)
-      pushEvent(`It dealt ${res.damage} damage!`, { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult }, 1300);
+      // 3) Text beat: show damage as a separate line
+      pushEvent(`It dealt ${res.damage} damage!`, { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult }, 1100);
+
+      // 4) Impact beat: defender shakes/flashes and HP ticks down after the damage line.
+      pushEvent("", { kind: "impact", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult, hpFrom: hpBefore, hpTo: hpAfter }, 650);
 
       // Optional simplified status inflict (burn/poison) after a successful damaging hit
       maybeInflictStatus({ attackerSide: attSide, defenderSide: defSide, attacker: att, defender: def, move: mv, hit: true, mult: res.mult, rng, pushEvent });

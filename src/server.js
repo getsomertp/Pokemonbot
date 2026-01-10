@@ -951,6 +951,25 @@ function renderFrame(i){
       animateEnter(foeSprite, 'foeEnter');
     }
 
+    if(a.kind === 'trainer_intro'){
+      // Trainer battle intro beat (quick, readable)
+      showPopup('TRAINER BATTLE!');
+      pushMoveLine('⚔️ Trainer battle');
+    }
+
+    if(a.kind === 'speed_tie'){
+      showPopup('SPEED TIE!');
+      pushMoveLine('↳ Speed tie');
+      // Tiny flash to make it feel like a coin-flip moment
+      battleEl.classList.remove('flash'); void battleEl.offsetWidth; battleEl.classList.add('flash');
+    }
+
+    if(a.kind === 'speed_result'){
+      const firstName = (a.winner === 'L') ? (b.user?.name || 'You') : (b.foe?.name || 'Foe');
+      showPopup(firstName + ' FIRST!');
+      pushMoveLine('↳ ' + firstName + ' first');
+    }
+
     if(a.kind === 'sendout'){
       animateEnter(userSprite, 'userEnter');
     }
@@ -1369,9 +1388,37 @@ async function handleChat({ username, userId, content }) {
     const lvlTag = s.level ? `Lv. ${s.level} ` : "";
 
     // Notify overlay: play battle animation.
+    // IMPORTANT: pause the wild despawn timer during the battle playback so the
+    // overlay doesn't clear mid-fight. We do this by extending expiresAt long enough
+    // to cover the animation.
+    const framesAll = (result.events || result.simEvents || result.frames || []);
+    const frames = Array.isArray(framesAll) ? framesAll.slice(0, 140) : [];
+
     try {
-      const framesAll = (result.events || result.simEvents || result.frames || []);
-      const frames = framesAll.slice(0, 140); // cap to keep overlay snappy
+
+      // Extend spawn expiry if needed (wild battles only).
+      try {
+        const spawn = result.spawn;
+        if (spawn && spawn.id && !spawn.caughtAt) {
+          // Total playback time = sum(frame durations) + small gaps used by overlay.
+          const durMs = frames.reduce((acc, f) => acc + (Number(f?.durationMs) || 1000) + 60, 0);
+          const safetyMs = 2000;
+          const minExpiresAt = new Date(Date.now() + durMs + safetyMs);
+          const curExpiresAt = new Date(spawn.expiresAt);
+          if (curExpiresAt.getTime() < minExpiresAt.getTime()) {
+            const updated = await prisma.spawn.update({
+              where: { id: spawn.id },
+              data: { expiresAt: minExpiresAt }
+            });
+            // If the spawn is currently shown on overlay, refresh its timer bar.
+            if (overlayLastSpawn && overlayLastSpawn.id === updated.id) {
+              overlayLastSpawn = updated;
+              overlayBroadcast(overlayEventFromSpawn(updated));
+            }
+          }
+        }
+      } catch {}
+
       overlayBroadcast({
         type: "battle",
         battle: {
