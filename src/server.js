@@ -6,6 +6,7 @@ const { execSync } = require("child_process");
 const crypto = require("crypto");
 const cookieParser = require("cookie-parser");
 const WebSocket = require("ws");
+const path = require("path");
 
 const { prisma } = require("./prisma");
 const { Game } = require("./game");
@@ -22,6 +23,12 @@ app.use(cors());
 app.use(express.json());
 app.use(cookieParser(process.env.COOKIE_SECRET || "dev_cookie_secret"));
 
+// Static assets for OBS overlay (sounds, images, etc)
+app.use("/sounds", express.static(path.join(__dirname, "..", "public", "sounds")));
+
+// Static assets (OBS overlay sounds, etc.)
+app.use(express.static(path.join(__dirname, "..", "public")));
+
 const PORT = Number(process.env.PORT || 3000);
 const PREFIX = process.env.COMMAND_PREFIX || "!";
 const KICK_CHANNEL = process.env.KICK_CHANNEL;
@@ -34,6 +41,11 @@ const STREAMER_USERNAME = (process.env.STREAMER_USERNAME || PRIMARY_CHANNEL || "
 
 const game = new Game();
 
+// ---- Trainer vs Trainer duels (in-memory challenge/accept) ----
+// Map: opponentHandleLower -> { challengerHandleLower, challengerName, challengerPlatformUserId, createdAt }
+const duelRequests = new Map();
+const DUEL_TTL_MS = 60 * 1000; // 60s to accept
+
 // ---- Readiness / health (helps avoid Railway 502 confusion) ----
 let READY = false;
 let BOOT_ERROR = null;
@@ -41,6 +53,107 @@ let BOOT_ERROR = null;
 // ---- Overlay (OBS Browser Source) ----
 let overlayWss = null;
 let overlayLastSpawn = null;
+// In-memory overlay event queue (WebSocket + polling fallback)
+let overlaySeq = 0;
+const overlayQueue = [];
+const OVERLAY_QUEUE_MAX = 40;
+
+// Overlay sound settings (stored in Prisma Setting table)
+function soundKey(streamer, part) {
+  const s = normStreamer(streamer || PRIMARY_CHANNEL);
+  return `overlay:${s}:sound:${part}`;
+}
+
+async function getSoundSettings(streamer) {
+  const s = normStreamer(streamer || PRIMARY_CHANNEL);
+  const [enabledRow, volumeRow] = await Promise.all([
+    prisma.setting.findUnique({ where: { key: soundKey(s, "enabled") } }),
+    prisma.setting.findUnique({ where: { key: soundKey(s, "volume") } })
+  ]);
+  const enabled = enabledRow?.value != null ? enabledRow.value === "1" : true;
+  const volume = volumeRow?.value != null ? Math.max(0, Math.min(1, Number(volumeRow.value))) : 0.5;
+  return { streamer: s, enabled, volume };
+}
+
+async function setSoundSettings(streamer, { enabled, volume }) {
+  const s = normStreamer(streamer || PRIMARY_CHANNEL);
+  if (!s) return { streamer: s, enabled: true, volume: 0.5 };
+
+  if (enabled != null) {
+    await prisma.setting.upsert({
+      where: { key: soundKey(s, "enabled") },
+      update: { value: enabled ? "1" : "0" },
+      create: { key: soundKey(s, "enabled"), value: enabled ? "1" : "0" }
+    });
+  }
+  if (volume != null) {
+    const v = Math.max(0, Math.min(1, Number(volume)));
+    await prisma.setting.upsert({
+      where: { key: soundKey(s, "volume") },
+      update: { value: String(v) },
+      create: { key: soundKey(s, "volume"), value: String(v) }
+    });
+  }
+
+  const cur = await getSoundSettings(s);
+  overlayBroadcast({ type: "sound_settings", settings: cur });
+  return cur;
+}
+
+// ---- Economy (leaderpoints) + Betting ----
+// Wagering uses the SAME currency as the leaderboard: pointsEarned ("leaderpoints").
+// We can't subtract from Catch rows (they are history), so we store a per-user adjustment
+// in the Setting table and include it in totals.
+// Keys:
+//  - lp_adj:<userId> => signed integer adjustment added to sum(pointsEarned)
+
+function lpAdjKey(userId) {
+  return `lp_adj:${userId}`;
+}
+
+async function getLpAdj(userId) {
+  const row = await prisma.setting.findUnique({ where: { key: lpAdjKey(userId) } });
+  if (!row?.value) return 0;
+  const n = Number(row.value);
+  return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+
+async function setLpAdj(userId, amount) {
+  const n = Math.trunc(Number(amount) || 0);
+  await prisma.setting.upsert({
+    where: { key: lpAdjKey(userId) },
+    update: { value: String(n) },
+    create: { key: lpAdjKey(userId), value: String(n) }
+  });
+  return n;
+}
+
+async function addLpAdj(userId, delta) {
+  const cur = await getLpAdj(userId);
+  return setLpAdj(userId, cur + (Math.trunc(Number(delta) || 0)));
+}
+
+async function getLeaderPoints(userId) {
+  const agg = await prisma.catch.aggregate({ where: { userId }, _sum: { pointsEarned: true } });
+  const base = agg?._sum?.pointsEarned || 0;
+  const adj = await getLpAdj(userId);
+  return base + adj;
+}
+function payoutMultiplierForSpawn(spawn) {
+  // Tune to taste via env vars later.
+  const tier = String(spawn?.tier || "common").toLowerCase();
+  const baseByTier = {
+    common: 1.5,
+    uncommon: 2,
+    rare: 3,
+    epic: 5,
+    legendary: 8
+  };
+  const base = baseByTier[tier] || 1.5;
+  const shinyMult = spawn?.isShiny ? 3 : 1;
+  return base * shinyMult;
+}
+
 
 function spriteUrlForSpawn(spawn) {
   try {
@@ -56,6 +169,22 @@ function spriteUrlForSpawn(spawn) {
     return null;
   }
 }
+
+function spriteUrlForName(name, { shiny = false } = {}) {
+  try {
+    if (!name) return null;
+    const d = dex.loadDex();
+    const mon = d.pokemon.find((x) => String(x.name).toLowerCase() === String(name).toLowerCase()) || d.pokemon.find((x) => x.id === name);
+    const dexNum = mon?.dex;
+    if (!dexNum) return null;
+    const base = 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon';
+    if (shiny) return `${base}/shiny/${dexNum}.png`;
+    return `${base}/${dexNum}.png`;
+  } catch {
+    return null;
+  }
+}
+
 
 function overlayEventFromSpawn(spawn) {
   if (!spawn) return { type: 'clear' };
@@ -76,13 +205,31 @@ function overlayEventFromSpawn(spawn) {
 
 function overlayBroadcast(event) {
   try {
+    // Stamp event with a monotonic id so the overlay can poll reliably.
+    // We still send over WebSocket when available.
+    overlaySeq += 1;
+    const stamped = Object.assign({ _id: overlaySeq }, event || {});
+    overlayQueue.push(stamped);
+    while (overlayQueue.length > OVERLAY_QUEUE_MAX) overlayQueue.shift();
+
     if (!overlayWss) return;
-    const payload = JSON.stringify(event);
+    const payload = JSON.stringify(stamped);
     for (const client of overlayWss.clients) {
       if (client.readyState === 1) client.send(payload);
     }
   } catch {}
 }
+
+// Polling fallback for OBS browser sources where WS upgrades might be blocked.
+app.get('/overlay/poll', (req, res) => {
+  try {
+    const since = Number(req.query.since || 0);
+    const evs = overlayQueue.filter(e => (Number(e?._id) || 0) > since);
+    res.json({ ok: true, now: overlaySeq, events: evs });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'internal_error' });
+  }
+});
 
 app.get("/", (req, res) => res.status(200).send("ok"));
 
@@ -260,11 +407,31 @@ function spawnLabel(spawn) {
 }
 
 async function announceSpawn(spawn) {
-  const msg = `A wild ${spawnLabel(spawn)} appeared! Type ${PREFIX}catch ${spawn.pokemon}`;
+  const msg = `A wild ${spawnLabel(spawn)} appeared! Type ${PREFIX}catch`;
 
   // Push to OBS overlay
   overlayLastSpawn = spawn;
   overlayBroadcast(overlayEventFromSpawn(spawn));
+
+  // Schedule a despawn event so the overlay (and looping sound) can end exactly
+  // when the Pokémon is no longer capturable.
+  try {
+    const ms = Math.max(0, new Date(spawn.expiresAt).getTime() - Date.now());
+    setTimeout(async () => {
+      try {
+        const active = await game.getActiveSpawn();
+        const stillActiveSame = active && active.id === spawn.id;
+        if (stillActiveSame) return;
+
+        // Only emit if this spawn is still what's shown on the overlay
+        if (overlayLastSpawn && overlayLastSpawn.id === spawn.id) {
+          overlayBroadcast({ type: "despawn", spawnId: spawn.id });
+          overlayBroadcast({ type: "clear" });
+          overlayLastSpawn = null;
+        }
+      } catch {}
+    }, ms + 50);
+  } catch {}
 
   try {
     await refreshKickTokenIfNeeded();
@@ -276,18 +443,46 @@ async function announceSpawn(spawn) {
 }
 
 async function spawnLoop() {
-  const spawn = await game.ensureSpawnExists();
-  await announceSpawn(spawn);
+  // Ensure a spawn exists at boot (optional). If you want *no* immediate spawn,
+  // set SPAWN_ON_BOOT=0.
+  const spawnOnBoot = String(process.env.SPAWN_ON_BOOT || "1") !== "0";
+  if (spawnOnBoot) {
+    const spawn = await game.ensureSpawnExists();
+    await announceSpawn(spawn);
+  }
 
-  const interval = envInt("SPAWN_INTERVAL_SECONDS", 90) * 1000;
-  setInterval(async () => {
-    try {
-      const s = await game.spawn();
-      await announceSpawn(s);
-    } catch (e) {
-      console.error("Spawn loop error:", e);
-    }
-  }, interval);
+  // Randomized spawn interval (min/max)
+  // Defaults: 60s - 900s (1m - 15m)
+  const minS = envInt("SPAWN_DELAY_MIN_SECONDS", 60);
+  const maxS = envInt("SPAWN_DELAY_MAX_SECONDS", 900);
+  const nextDelayMs = () => {
+    const min = Math.max(5, minS);
+    const max = Math.max(min, maxS);
+    const secs = min + Math.floor(Math.random() * (max - min + 1));
+    return secs * 1000;
+  };
+
+  let timer = null;
+  const schedule = () => {
+    if (timer) clearTimeout(timer);
+    const delay = nextDelayMs();
+    console.log(`[spawn] next spawn in ${Math.round(delay / 1000)}s`);
+    timer = setTimeout(async () => {
+      try {
+        const active = await game.getActiveSpawn();
+        if (!active) {
+          const s = await game.spawn();
+          await announceSpawn(s);
+        }
+      } catch (e) {
+        console.error("Spawn loop error:", e);
+      } finally {
+        schedule();
+      }
+    }, delay);
+  };
+
+  schedule();
 }
 
 // ---------- PKCE helpers (REQUIRED by Kick OAuth 2.1) ----------
@@ -468,68 +663,756 @@ app.get("/state", async (req, res) => {
 });
 
 // ---------- OBS Overlay ----------
+
+// ---- Trainer inventory page (public) ----
+const _dexForPages = (() => {
+  try { return dex.loadDex(); } catch { return null; }
+})();
+
+function _escHtml(s = "") {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function _tierRank(tier) {
+  switch (String(tier || "").toLowerCase()) {
+    case "legendary": return 5;
+    case "epic": return 4;
+    case "rare": return 3;
+    case "uncommon": return 2;
+    case "common": return 1;
+    default: return 0;
+  }
+}
+
+function _getDexEntryByName(name) {
+  const n = String(name || "").toLowerCase();
+  const data = _dexForPages;
+  if (!data?.pokemon?.length) return null;
+  // match on canonical name, else try id
+  return data.pokemon.find(p => String(p.name || "").toLowerCase() === n || String(p.id || "").toLowerCase() === n) || null;
+}
+
+function _officialArtworkUrl(dexNumber) {
+  const n = Number(dexNumber);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/other/official-artwork/${n}.png`;
+}
+
+app.get("/trainer/:username", async (req, res) => {
+  const handle = String(req.params.username || "").toLowerCase();
+
+  const ident = await prisma.userIdentity.findUnique({
+    where: { platform_handle: { platform: "kick", handle } },
+    include: { user: true }
+  });
+
+  if (!ident?.user) {
+    res.status(404).type("html").send("<h1 style=\"font-family:system-ui;padding:24px\">Trainer not found</h1>");
+    return;
+  }
+
+  const user = ident.user;
+
+  const shinyOnly = String(req.query.shiny || "").toLowerCase();
+  const rarity = String(req.query.rarity || "").toLowerCase();
+  const sort = String(req.query.sort || "recent").toLowerCase();
+
+  const page = Math.max(1, Number.parseInt(req.query.page || "1", 10) || 1);
+  const limit = Math.min(200, Math.max(20, Number.parseInt(req.query.limit || "100", 10) || 100));
+  const skip = (page - 1) * limit;
+
+  const where = { userId: user.id };
+  if (shinyOnly === "1" || shinyOnly === "true" || shinyOnly === "yes") where.isShiny = true;
+  if (rarity) where.tier = rarity;
+
+  const orderBy =
+    sort === "level"
+      ? [{ level: "desc" }, { caughtAt: "desc" }]
+      : sort === "pokemon"
+        ? [{ pokemon: "asc" }, { caughtAt: "desc" }]
+        : [{ caughtAt: "desc" }];
+
+  const [total, rows] = await Promise.all([
+    prisma.catch.count({ where }),
+    prisma.catch.findMany({ where, orderBy, skip, take: limit })
+  ]);
+
+  const totalPages = Math.max(1, Math.ceil(total / limit));
+
+  const chips = [];
+  if (where.isShiny) chips.push("✨ Shiny");
+  if (rarity) chips.push(`Rarity: ${rarity}`);
+  chips.push(`Sort: ${sort}`);
+
+  const buildQS = (patch) => {
+    const q = new URLSearchParams({
+      ...(shinyOnly ? { shiny: shinyOnly } : {}),
+      ...(rarity ? { rarity } : {}),
+      ...(sort ? { sort } : {}),
+      page: String(page),
+      limit: String(limit),
+      ...patch
+    });
+    // drop defaults
+    if (!q.get("shiny") || q.get("shiny") === "0" || q.get("shiny") === "false") q.delete("shiny");
+    if (!q.get("rarity")) q.delete("rarity");
+    if (!q.get("sort") || q.get("sort") === "recent") q.delete("sort");
+    if (q.get("page") === "1") q.delete("page");
+    if (q.get("limit") === "100") q.delete("limit");
+    return q.toString() ? `?${q.toString()}` : "";
+  };
+
+  const cards = rows.map((c) => {
+    const entry = _getDexEntryByName(c.pokemon);
+    const art = entry?.dex ? _officialArtworkUrl(entry.dex) : null;
+    const name = _escHtml(c.pokemon);
+    const lvl = c.level ?? "?";
+    const tier = _escHtml(c.tier || "");
+    const shiny = c.isShiny ? "✨" : "";
+    const caught = c.caughtAt ? new Date(c.caughtAt).toISOString().slice(0, 10) : "";
+    return `
+      <div class="card">
+        <div class="art">${art ? `<img loading="lazy" src="${art}" alt="${name}"/>` : `<div class="noart">?</div>`}</div>
+        <div class="info">
+          <div class="title">${shiny} ${name}</div>
+          <div class="meta">Lv ${lvl} • HP ${(c.currentHp ?? c.maxHp) != null ? String(c.currentHp ?? c.maxHp) + "/" + String(c.maxHp ?? c.currentHp) : "—"} • ${tier || "—"} • ${caught}</div>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const prevHref = page > 1 ? `/trainer/${handle}${buildQS({ page: String(page - 1) })}` : null;
+  const nextHref = page < totalPages ? `/trainer/${handle}${buildQS({ page: String(page + 1) })}` : null;
+
+  res.status(200).type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>${_escHtml(user.displayName || handle)} — Pokémon</title>
+  <style>
+    :root{color-scheme:dark}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#0b0f14;color:#e8eef6}
+    a{color:#9ad0ff;text-decoration:none}
+    a:hover{text-decoration:underline}
+    .wrap{max-width:1040px;margin:0 auto;padding:22px}
+    h1{margin:0 0 6px;font-size:22px}
+    .sub{opacity:.78;margin-bottom:14px}
+    .bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:14px 0 16px}
+    .pill{display:inline-flex;gap:8px;align-items:center;border:1px solid #1f2a3a;background:#121926;border-radius:999px;padding:8px 12px;font-size:13px;opacity:.92}
+    .pill b{font-weight:700}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+    .card{display:flex;gap:12px;align-items:center;background:#121926;border:1px solid #1f2a3a;border-radius:16px;padding:10px}
+    .art{width:64px;height:64px;display:grid;place-items:center;border-radius:14px;background:#0f1520;border:1px solid #1f2a3a;overflow:hidden}
+    .art img{width:64px;height:64px;object-fit:contain}
+    .noart{opacity:.45;font-weight:800}
+    .title{font-weight:800}
+    .meta{opacity:.78;font-size:12.5px;margin-top:3px}
+    .controls{display:flex;flex-wrap:wrap;gap:8px}
+    .btn{border:1px solid #1f2a3a;background:#0f1520;border-radius:12px;padding:8px 10px;font-size:13px}
+    .btn.on{background:#162338}
+    .pager{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-top:16px}
+    .muted{opacity:.75}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>${_escHtml(user.displayName || handle)}’s Pokémon</h1>
+    <div class="sub">Total: ${total} • Showing ${rows.length} (page ${page}/${totalPages})</div>
+
+    <div class="bar">
+      <span class="pill"><b>Filters</b> ${chips.map(_escHtml).join(" • ")}</span>
+      <div class="controls">
+        <a class="btn ${where.isShiny ? "on" : ""}" href="/trainer/${handle}${buildQS({ shiny: where.isShiny ? "" : "1", page: "1" })}">✨ Shiny</a>
+        <a class="btn ${rarity === "legendary" ? "on" : ""}" href="/trainer/${handle}${buildQS({ rarity: rarity === "legendary" ? "" : "legendary", page: "1" })}">Legendary</a>
+        <a class="btn ${rarity === "epic" ? "on" : ""}" href="/trainer/${handle}${buildQS({ rarity: rarity === "epic" ? "" : "epic", page: "1" })}">Epic</a>
+        <a class="btn ${rarity === "rare" ? "on" : ""}" href="/trainer/${handle}${buildQS({ rarity: rarity === "rare" ? "" : "rare", page: "1" })}">Rare</a>
+        <a class="btn ${rarity === "uncommon" ? "on" : ""}" href="/trainer/${handle}${buildQS({ rarity: rarity === "uncommon" ? "" : "uncommon", page: "1" })}">Uncommon</a>
+        <a class="btn ${rarity === "common" ? "on" : ""}" href="/trainer/${handle}${buildQS({ rarity: rarity === "common" ? "" : "common", page: "1" })}">Common</a>
+      </div>
+    </div>
+
+    <div class="bar">
+      <span class="pill"><b>Sort</b></span>
+      <div class="controls">
+        <a class="btn ${sort === "recent" ? "on" : ""}" href="/trainer/${handle}${buildQS({ sort: "recent", page: "1" })}">Recent</a>
+        <a class="btn ${sort === "level" ? "on" : ""}" href="/trainer/${handle}${buildQS({ sort: "level", page: "1" })}">Level</a>
+        <a class="btn ${sort === "pokemon" ? "on" : ""}" href="/trainer/${handle}${buildQS({ sort: "pokemon", page: "1" })}">Name</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      ${cards || '<div class="muted">No Pokémon match these filters.</div>'}
+    </div>
+
+    <div class="pager">
+      <div class="muted">Tip: add <code>?shiny=1</code>, <code>?rarity=legendary</code>, <code>?sort=level</code></div>
+      <div>
+        ${prevHref ? `<a class="btn" href="${prevHref}">← Prev</a>` : `<span class="btn muted">← Prev</span>`}
+        <span class="btn muted">Page ${page}/${totalPages}</span>
+        ${nextHref ? `<a class="btn" href="${nextHref}">Next →</a>` : `<span class="btn muted">Next →</span>`}
+      </div>
+    </div>
+  </div>
+</body>
+</html>`);
+});
+
+
 app.get("/overlay", (req, res) => {
-  const html = [
-    '<!doctype html>',
-    '<html>',
-    '<head>',
-    '<meta charset="utf-8"/>',
-    '<meta name="viewport" content="width=device-width, initial-scale=1"/>',
-    '<title>Pokemon Overlay</title>',
-    '<style>',
-    '  body{margin:0; background:transparent; overflow:hidden;}',
-    '  #wrap{position:relative; width:100vw; height:100vh;}',
-    '  #card{position:absolute; left:40px; top:40px; display:none; align-items:center; gap:18px; padding:14px 18px; border-radius:18px; background:rgba(0,0,0,0.55); backdrop-filter:blur(6px); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}',
-    '  #sprite{width:140px; height:140px; image-rendering:pixelated;}',
-    '  #name{font-size:28px; font-weight:800; line-height:1.1;}',
-    '  #meta{opacity:0.9; font-size:18px;}',
-    '  .shiny{filter: drop-shadow(0 0 18px rgba(255,255,255,0.9));}',
-    '  .pop{animation: pop 300ms ease-out;}',
-    '  @keyframes pop{from{transform:scale(0.85); opacity:0;} to{transform:scale(1); opacity:1;}}',
-    '</style>',
-    '</head>',
-    '<body>',
-    '<div id="wrap">',
-    '  <div id="card">',
-    '    <img id="sprite"/>',
-    '    <div>',
-    '      <div id="name"></div>',
-    '      <div id="meta"></div>',
-    '    </div>',
-    '  </div>',
-    '</div>',
-    '<script>',
-    '  const card = document.getElementById("card");',
-    '  const sprite = document.getElementById("sprite");',
-    '  const nameEl = document.getElementById("name");',
-    '  const metaEl = document.getElementById("meta");',
-    '  let hideT = null;',
-    '  function show(spawn){',
-    '    if(!spawn || !spawn.sprite) return;',
-    '    sprite.src = spawn.sprite;',
-    '    sprite.className = spawn.isShiny ? "shiny" : "";',
-    '    nameEl.textContent = (spawn.isShiny ? "✨ " : "") + spawn.name;',
-    '    metaEl.textContent = `Lv. ${spawn.level} • ${spawn.tier}`;',
-    '    card.style.display = "flex";',
-    '    card.classList.remove("pop");',
-    '    void card.offsetWidth;',
-    '    card.classList.add("pop");',
-    '    if(hideT) clearTimeout(hideT);',
-    '    hideT = setTimeout(()=>{ card.style.display = "none"; }, 15000);',
-    '  }',
-    '  function clear(){ card.style.display = "none"; }',
-    '  const proto = location.protocol === "https:" ? "wss" : "ws";',
-    '  const ws = new WebSocket(`${proto}://${location.host}/overlay/ws`);',
-    '  ws.onmessage = (e)=>{',
-    '    try{',
-    '      const msg = JSON.parse(e.data);',
-    '      if(msg.type === "spawn") show(msg.spawn);',
-    '      if(msg.type === "clear") clear();',
-    '    }catch{}',
-    '  };',
-    '</script>',
-    '</body></html>'
-  ].join("\n");
+  const showUi = String(req.query.ui || "") === "1";
+  const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Pokemon Overlay</title>
+  <style>
+    html,body{margin:0; padding:0; width:450px; height:450px; background:transparent; overflow:hidden;}
+    #wrap{position:relative; width:450px; height:450px;}
+    #card{position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); display:none; align-items:center; gap:18px; padding:14px 18px; border-radius:18px; background:rgba(0,0,0,0.55); backdrop-filter:blur(6px); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+    #sprite{width:160px; height:160px; image-rendering:pixelated;}
+    #name{font-size:28px; font-weight:800; line-height:1.1; white-space:nowrap; max-width:240px; overflow:hidden; text-overflow:ellipsis;}
+    #meta{opacity:0.9; font-size:18px;}
+    .shiny{filter: drop-shadow(0 0 18px rgba(255,255,255,0.9)); animation: shimmer 1.2s ease-in-out infinite;}
+    @keyframes shimmer{0%{filter: drop-shadow(0 0 10px rgba(255,255,255,0.45));} 50%{filter: drop-shadow(0 0 24px rgba(255,255,255,0.95));} 100%{filter: drop-shadow(0 0 10px rgba(255,255,255,0.45));}}
+    .pop{animation: pop 300ms ease-out;}
+    @keyframes pop{from{transform:translate(-50%,-50%) scale(0.85); opacity:0;} to{transform:translate(-50%,-50%) scale(1); opacity:1;}}
+    #barWrap{margin-top:10px; width:260px; height:10px; background:rgba(255,255,255,0.20); border-radius:999px; overflow:hidden;}
+    #bar{width:100%; height:100%; background:rgba(255,255,255,0.85); transform-origin:left center; transition: transform 220ms linear;}
+    #toast{position:absolute; left:50%; top:calc(50% + 125px); transform:translateX(-50%); display:none; padding:10px 14px; border-radius:14px; background:rgba(0,0,0,0.60); color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; font-size:20px; white-space:nowrap;}
+    #toast.show{display:block; animation: toast 1400ms ease-out both;}
+    @keyframes toast{0%{transform:translate(-50%,-6px); opacity:0;} 12%{transform:translate(-50%,0); opacity:1;} 80%{opacity:1;} 100%{transform:translate(-50%,6px); opacity:0;}}
+
+    /* Catch animation */
+    #catchAnim{position:absolute; left:0; top:0; width:450px; height:450px; display:none; align-items:center; justify-content:center; flex-direction:column; gap:10px; color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+    #catchAnim.show{display:flex;}
+    #catchBall{font-size:64px; line-height:1; filter:drop-shadow(0 0 14px rgba(0,0,0,0.6));}
+    #catchBall.shake{animation: ballShake 520ms ease-in-out both;}
+    @keyframes ballShake{0%{transform:translateX(0) rotate(0deg);} 10%{transform:translateX(-10px) rotate(-8deg);} 25%{transform:translateX(10px) rotate(8deg);} 40%{transform:translateX(-8px) rotate(-6deg);} 55%{transform:translateX(8px) rotate(6deg);} 70%{transform:translateX(-6px) rotate(-4deg);} 100%{transform:translateX(0) rotate(0deg);} }
+    #catchLine{font-size:20px; font-weight:800; text-align:center; padding:10px 14px; border-radius:14px; background:rgba(0,0,0,0.60); backdrop-filter:blur(6px); max-width:410px;}
+
+    /* Battle overlay */
+    #battle{position:absolute; left:0; top:0; width:450px; height:450px; display:none; color:white; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;}
+    #battle.show{display:block;}
+    #battleTop{position:absolute; left:0; top:0; width:450px; height:240px;}
+    #battleBottom{position:absolute; left:0; top:190px; width:450px; height:180px;}
+    .sprite{image-rendering:pixelated;}
+    .foeSprite{position:absolute; right:28px; top:40px; width:140px; height:140px;}
+    .userSprite{position:absolute; left:28px; top:20px; width:150px; height:150px;}
+    /* Send-out animations (slide-in sprites) */
+    .userEnter{animation:userEnter 520ms cubic-bezier(.22,.9,.25,1.05) both;}
+    @keyframes userEnter{0%{left:-180px; opacity:0;} 70%{left:40px; opacity:1;} 100%{left:28px; opacity:1;}}
+    .foeEnter{animation:foeEnter 520ms cubic-bezier(.22,.9,.25,1.05) both;}
+    @keyframes foeEnter{0%{right:-180px; opacity:0;} 70%{right:40px; opacity:1;} 100%{right:28px; opacity:1;}}
+
+    .side{position:absolute; padding:12px 14px; border-radius:16px; background:rgba(0,0,0,0.55); backdrop-filter:blur(6px); min-width:240px;}
+    .side.foe{left:22px; top:26px;}
+    .side.user{right:22px; top:24px;}
+    .label{display:flex; justify-content:space-between; gap:10px; font-weight:800; font-size:18px; white-space:nowrap;}
+    .label span{max-width:170px; overflow:hidden; text-overflow:ellipsis;}
+    .hpWrap{margin-top:10px; width:100%; height:12px; background:rgba(255,255,255,0.20); border-radius:999px; overflow:hidden;}
+    .hp{width:100%; height:100%; background:rgba(255,255,255,0.90); transform-origin:left center; transition: transform 520ms linear;}
+    .hp.hpLow{animation: hpLow 520ms ease-in-out infinite;}
+    @keyframes hpLow{0%{filter:brightness(1);} 50%{filter:brightness(1.35);} 100%{filter:brightness(1);}}
+    #battleText{position:absolute; left:22px; right:22px; bottom:18px; padding:14px 16px; border-radius:16px; background:rgba(0,0,0,0.65); backdrop-filter:blur(6px); font-size:18px; line-height:1.25; min-height:54px; white-space:pre-line;}
+    #battle.flash{animation: battleFlash 180ms ease-out;}
+    @keyframes battleFlash{from{transform:scale(0.99); opacity:0.85;} to{transform:scale(1); opacity:1;}}
+
+    /* Damage feedback */
+    .shake{animation: shake 260ms ease-in-out;}
+    @keyframes shake{
+      0%{transform:translate(0,0);} 15%{transform:translate(-6px,0);} 30%{transform:translate(6px,0);} 45%{transform:translate(-5px,0);} 60%{transform:translate(5px,0);} 75%{transform:translate(-3px,0);} 100%{transform:translate(0,0);} 
+    }
+    .hitFlash{animation: hitFlash 180ms ease-out;}
+    @keyframes hitFlash{from{filter:brightness(1.9) contrast(1.05);} to{filter:brightness(1) contrast(1);}}
+
+    /* Attack "lunge" when using a move */
+    .attackUser{animation: userAttack 260ms ease-out;}
+    @keyframes userAttack{0%{transform:translate(0,0);} 45%{transform:translate(18px,-4px);} 100%{transform:translate(0,0);} }
+    .attackFoe{animation: foeAttack 260ms ease-out;}
+    @keyframes foeAttack{0%{transform:translate(0,0);} 45%{transform:translate(-18px,4px);} 100%{transform:translate(0,0);} }
+
+    /* Effectiveness / crit popup */
+    #popup{position:absolute; left:50%; top:160px; transform:translateX(-50%); display:none; padding:10px 14px; border-radius:14px; background:rgba(0,0,0,0.70); backdrop-filter:blur(6px); font-weight:900; letter-spacing:0.5px; font-size:20px; text-transform:uppercase; white-space:nowrap;}
+    #popup.show{display:block; animation: popup 850ms ease-out both;}
+    @keyframes popup{0%{transform:translate(-50%,8px) scale(0.92); opacity:0;} 18%{transform:translate(-50%,0) scale(1); opacity:1;} 80%{opacity:1;} 100%{transform:translate(-50%,-6px) scale(1); opacity:0;}}
+
+    /* Small move log */
+    #moveLog{position:absolute; left:22px; right:22px; bottom:92px; padding:10px 12px; border-radius:14px; background:rgba(0,0,0,0.45); backdrop-filter:blur(6px); font-size:13px; line-height:1.25; max-height:76px; overflow:hidden;}
+    #moveLog .line{opacity:0.95; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+    ${showUi ? '#ui{position:absolute; right:16px; bottom:16px; background:rgba(0,0,0,0.5); color:white; padding:12px; border-radius:12px; font-family:system-ui;}' : '#ui{display:none;}'}
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="card">
+      <img id="sprite"/>
+      <div>
+        <div id="name"></div>
+        <div id="meta"></div>
+        <div id="barWrap"><div id="bar"></div></div>
+      </div>
+    </div>
+
+    <div id="battle">
+      <div id="battleTop">
+        <div class="side foe">
+          <div class="label"><span id="foeName"></span><span id="foeMeta"></span></div>
+          <div class="hpWrap"><div id="foeHp" class="hp"></div></div>
+        </div>
+        <img id="foeSprite" class="sprite foeSprite"/>
+      </div>
+
+      <div id="battleBottom">
+        <img id="userSprite" class="sprite userSprite"/>
+        <div class="side user">
+          <div class="label"><span id="userName"></span><span id="userMeta"></span></div>
+          <div class="hpWrap"><div id="userHp" class="hp"></div></div>
+        </div>
+      </div>
+
+      <div id="popup"></div>
+      <div id="moveLog"></div>
+      <div id="battleText"></div>
+    </div>
+
+    <div id="catchAnim">
+      <div id="catchBall">⚪</div>
+      <div id="catchLine"></div>
+    </div>
+
+    <div id="toast"></div>
+  </div>
+
+  <script>
+    const card = document.getElementById("card");
+    const sprite = document.getElementById("sprite");
+    const nameEl = document.getElementById("name");
+    const metaEl = document.getElementById("meta");
+    const bar = document.getElementById("bar");
+    const toast = document.getElementById("toast");
+    const catchAnim = document.getElementById("catchAnim");
+    const catchBall = document.getElementById("catchBall");
+    const catchLine = document.getElementById("catchLine");
+
+    const battleEl = document.getElementById("battle");
+    const battleText = document.getElementById("battleText");
+    const userSprite = document.getElementById("userSprite");
+    const foeSprite = document.getElementById("foeSprite");
+    const userName = document.getElementById("userName");
+    const userMeta = document.getElementById("userMeta");
+    const foeName = document.getElementById("foeName");
+    const foeMeta = document.getElementById("foeMeta");
+    const userHp = document.getElementById("userHp");
+    const foeHp = document.getElementById("foeHp");
+    const popup = document.getElementById("popup");
+    const moveLog = document.getElementById("moveLog");
+
+    let moveLines = [];
+
+    let battleTimer = null;
+    let battleIndex = 0;
+
+    let currentSpawn = null;
+
+    function show(spawn){
+      if(!spawn || !spawn.sprite) return;
+      currentSpawn = spawn;
+      sprite.src = spawn.sprite;
+      sprite.className = spawn.isShiny ? "shiny" : "";
+      nameEl.textContent = (spawn.isShiny ? "✨ " : "") + spawn.name;
+      metaEl.textContent = 'Lv. ' + spawn.level + ' • ' + spawn.tier;
+      card.style.display = "flex";
+      card.classList.remove("pop"); void card.offsetWidth; card.classList.add("pop");
+    }
+
+    function clear(){ currentSpawn=null; card.style.display = "none"; }
+
+    function showCatchAnim(line){
+      if(!catchAnim || !catchLine || !catchBall) return;
+      catchLine.textContent = line || "";
+      catchAnim.classList.add("show");
+    }
+
+    function hideCatchAnim(){
+      try{ if(catchAnim) catchAnim.classList.remove("show"); }catch{}
+    }
+
+    function ballShake(){
+      if(!catchBall) return;
+      catchBall.classList.remove('shake');
+      void catchBall.offsetWidth;
+      catchBall.classList.add('shake');
+    }
+
+    // Animated catch sequence: shake 1..2..3.. then "Gotcha!"
+    function caught(trainer, pokemon, isShiny, spriteUrl){
+      try{ hideBattle(); }catch{}
+      try{ card.style.display = "none"; }catch{}
+
+      const shiny = isShiny ? '✨ ' : '';
+      showCatchAnim('Throwing a Poké Ball…');
+      if(catchBall) catchBall.textContent = '🔴';
+
+      ballShake();
+      setTimeout(()=>{ showCatchAnim('…shake 1'); ballShake(); }, 650);
+      setTimeout(()=>{ showCatchAnim('…shake 2'); ballShake(); }, 1300);
+      setTimeout(()=>{ showCatchAnim('…shake 3'); ballShake(); }, 1950);
+      setTimeout(()=>{ showCatchAnim('Gotcha!'); }, 2550);
+
+      setTimeout(()=>{
+        hideCatchAnim();
+        toast.textContent = '🎮 ' + trainer + ' caught ' + shiny + pokemon + '!';
+        toast.classList.remove("show"); void toast.offsetWidth; toast.classList.add("show");
+        clear();
+      }, 3150);
+    }
+    function despawn(){ clear(); }
+
+    function setHp(el, cur, max){
+      try{
+        const pct = max ? Math.max(0, Math.min(1, cur / max)) : 1;
+        el.style.transform = 'scaleX(' + pct + ')';
+
+        // HP bar thresholds (Gen-1 style): green -> yellow -> red, with a low-HP pulse.
+        // We do this with simple inline styles so the overlay stays self-contained.
+        if (el){
+          el.classList.remove('hpLow');
+          if (pct <= 0.10 && pct > 0){
+            el.classList.add('hpLow');
+          }
+
+          // Use bright-ish colors that read well on transparent backgrounds.
+          if (pct > 0.50) el.style.background = 'rgba(80, 220, 120, 0.95)';
+          else if (pct > 0.20) el.style.background = 'rgba(240, 210, 80, 0.95)';
+          else el.style.background = 'rgba(240, 90, 90, 0.95)';
+        }
+      }catch{}
+    }
+
+    function stopBattleTimer(){
+      if(battleTimer){ clearTimeout(battleTimer); battleTimer=null; }
+      battleIndex = 0;
+    }
+
+    function hideBattle(){
+      stopBattleTimer();
+      moveLines = [];
+      if(moveLog) moveLog.innerHTML = "";
+      if(popup) popup.classList.remove("show");
+      if(battleEl){ battleEl.classList.remove("show"); battleEl.style.display="none"; }
+    }
+
+    function pulse(el, cls){
+      if(!el) return;
+      el.classList.remove(cls);
+      void el.offsetWidth;
+      el.classList.add(cls);
+      setTimeout(()=>{ try{ el.classList.remove(cls); }catch{} }, 320);
+    }
+
+    function showPopup(text){
+      if(!popup || !text) return;
+      popup.textContent = text;
+      popup.classList.remove("show");
+      void popup.offsetWidth;
+      popup.classList.add("show");
+    }
+
+    // --- Battle SFX ---
+    // Disabled for now (no click-to-unlock and no sound effects).
+    function playSfx(){ /* disabled */ }
+
+    function pushMoveLine(line){
+      if(!moveLog || !line) return;
+      moveLines.push(line);
+      if(moveLines.length > 5) moveLines = moveLines.slice(moveLines.length - 5);
+      moveLog.innerHTML = moveLines.map(l => '<div class="line">' + l.replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>').join('');
+    }
+
+    function playBattle(b){
+      if(!b || !battleEl) return;
+
+      // Hide spawn card while battling
+      card.style.display = "none";
+
+      // Fill UI
+      if(userSprite) userSprite.src = (b.user && b.user.sprite) || "";
+      if(foeSprite) foeSprite.src = (b.foe && b.foe.sprite) || "";
+      if(foeSprite && b.foe && b.foe.isShiny) foeSprite.classList.add("shiny"); else if(foeSprite) foeSprite.classList.remove("shiny");
+
+      if(userName) userName.textContent = (b.user && b.user.name) ? b.user.name : "You";
+      if(userMeta) userMeta.textContent = b.user && b.user.level ? "Lv. " + b.user.level : "";
+      if(foeName) foeName.textContent = (b.foe && b.foe.name) ? b.foe.name : "Wild";
+      if(foeMeta) foeMeta.textContent = b.foe && b.foe.level ? "Lv. " + b.foe.level : "";
+
+      const frames = Array.isArray(b.frames) ? b.frames : [];
+      // Default HP (start full)
+      const uMax = frames[0]?.leftMax || b.user?.maxHP || 100;
+      const fMax = frames[0]?.rightMax || b.foe?.maxHP || 100;
+      setHp(userHp, frames[0]?.leftHp ?? uMax, uMax);
+      setHp(foeHp, frames[0]?.rightHp ?? fMax, fMax);
+
+      battleEl.style.display = "block";
+      battleEl.classList.add("show");
+      battleEl.classList.remove("flash"); void battleEl.offsetWidth; battleEl.classList.add("flash");
+
+      stopBattleTimer();
+      battleIndex = 0;
+      moveLines = [];
+      if(moveLog) moveLog.innerHTML = "";
+      if(popup) popup.classList.remove("show");
+
+function animateEnter(spriteEl, cls){
+  if(!spriteEl) return;
+  spriteEl.classList.remove(cls);
+  void spriteEl.offsetWidth;
+  spriteEl.classList.add(cls);
+  setTimeout(()=>{ try{ spriteEl.classList.remove(cls); }catch{} }, 700);
+}
+
+function renderFrame(i){
+  const fr = frames[i];
+  if(!fr) return;
+
+  const a = fr.action || null;
+
+  // Text + HP
+  if(battleText) battleText.textContent = fr.text || "";
+
+  // Default: render HP from the frame snapshot.
+  // Special case: impact frames carry hpFrom/hpTo so we can tick down like mainline Pokémon.
+  const isImpact = a && a.kind === 'impact' && (a.hpFrom != null) && (a.hpTo != null);
+  if(isImpact){
+    // Show pre-hit HP immediately, then tick down shortly after.
+    if(a.defender === 'L') setHp(userHp, a.hpFrom, fr.leftMax ?? uMax);
+    else setHp(foeHp, a.hpFrom, fr.rightMax ?? fMax);
+    // Ensure the other bar still updates correctly.
+    if(a.defender === 'L') setHp(foeHp, fr.rightHp ?? fMax, fr.rightMax ?? fMax);
+    else setHp(userHp, fr.leftHp ?? uMax, fr.leftMax ?? uMax);
+
+    setTimeout(()=>{
+      try{
+        if(a.defender === 'L') setHp(userHp, a.hpTo, fr.leftMax ?? uMax);
+        else setHp(foeHp, a.hpTo, fr.rightMax ?? fMax);
+      }catch{}
+    }, 90);
+  } else {
+    setHp(userHp, fr.leftHp ?? uMax, fr.leftMax ?? uMax);
+    setHp(foeHp, fr.rightHp ?? fMax, fr.rightMax ?? fMax);
+  }
+
+  // Subtle flash on most frames, but skip on pause frames
+  if(!a || a.kind !== 'pause'){
+    battleEl.classList.remove("flash"); void battleEl.offsetWidth; battleEl.classList.add("flash");
+  }
+
+  // Animation / popups / move log
+  if(a){
+    const atkName = a.attacker === 'L' ? (b.user?.name || 'You') : (b.foe?.name || 'Wild');
+    const defSprite = a.defender === 'L' ? userSprite : foeSprite;
+
+    if(a.kind === 'start'){
+      // Wild appears
+      animateEnter(foeSprite, 'foeEnter');
+    }
+
+    if(a.kind === 'trainer_intro'){
+      // Trainer battle intro beat (quick, readable)
+      showPopup('TRAINER BATTLE!');
+      pushMoveLine('⚔️ Trainer battle');
+    }
+
+    if(a.kind === 'speed_tie'){
+      showPopup('SPEED TIE!');
+      pushMoveLine('↳ Speed tie');
+      // Tiny flash to make it feel like a coin-flip moment
+      battleEl.classList.remove('flash'); void battleEl.offsetWidth; battleEl.classList.add('flash');
+    }
+
+    if(a.kind === 'speed_result'){
+      const firstName = (a.winner === 'L') ? (b.user?.name || 'You') : (b.foe?.name || 'Foe');
+      showPopup(firstName + ' FIRST!');
+      pushMoveLine('↳ ' + firstName + ' first');
+    }
+
+    if(a.kind === 'sendout'){
+      animateEnter(userSprite, 'userEnter');
+    }
+
+    if(a.kind === 'use'){
+      // "X used MOVE!" (log only; battleText already shows it)
+      pushMoveLine(atkName + ' used ' + (a.moveName || 'a move') + '!');
+
+      // Attacker "lunge" animation like Pokémon (brief forward jab)
+      const atkSprite = a.attacker === 'L' ? userSprite : foeSprite;
+      pulse(atkSprite, a.attacker === 'L' ? 'attackUser' : 'attackFoe');
+    }
+
+    if(a.kind === 'attack'){
+      // Pure animation beat (keeps the same text on-screen)
+      const atkSprite = a.attacker === 'L' ? userSprite : foeSprite;
+      pulse(atkSprite, a.attacker === 'L' ? 'attackUser' : 'attackFoe');
+      // Extra little motion so it's obvious a move is being performed
+      pulse(atkSprite, 'shake');
+    }
+
+    if(a.kind === 'impact'){
+      // Impact beat: defender shakes/flashes while HP ticks down.
+      pulse(defSprite, 'shake');
+      pulse(defSprite, 'hitFlash');
+
+      // Hit SFX
+      playSfx('hit');
+      if(a.crit) playSfx('crit');
+      if(a.mult >= 2) playSfx('super');
+
+      // Add a compact summary to the move log (damage + tags)
+      const dmg = (a.damage != null) ? (' -' + a.damage) : '';
+      let effTag = '';
+      if(a.mult >= 4) effTag = ' (SUPER!)';
+      else if(a.mult === 2) effTag = ' (SUPER)';
+      else if(a.mult > 0 && a.mult <= 0.5) effTag = ' (RESIST)';
+      const critTag = a.crit ? ' (CRIT)' : '';
+      if(dmg) pushMoveLine('↳' + dmg + effTag + critTag);
+    }
+
+    if(a.kind === 'hit'){
+      // These are "text beats" after the impact. We avoid re-shaking here so it feels like Pokémon.
+      // Still show popups for crit/effectiveness.
+      if(a.mult >= 2) showPopup('SUPER EFFECTIVE!');
+      else if(a.mult > 0 && a.mult <= 0.5) showPopup('NOT VERY EFFECTIVE…');
+      else if(a.crit) showPopup('CRITICAL HIT!');
+    }
+
+    if(a.kind === 'status_inflict'){
+      // Status applied message (text already shows). Add a quick popup + log.
+      const st = String(a.status || '').toLowerCase();
+      if(st === 'burn') showPopup('BURNED!');
+      else if(st === 'poison') showPopup('POISONED!');
+      pushMoveLine('↳ ' + (st ? st.toUpperCase() : 'STATUS'));
+      playSfx('status');
+    }
+
+    if(a.kind === 'status_tick'){
+      // DOT tick (text already shows)
+      playSfx('status');
+    }
+
+    if(a.kind === 'faint'){
+      playSfx('faint');
+    }
+
+    if(a.kind === 'miss'){
+      pushMoveLine('↳ MISS!');
+      showPopup('MISS!');
+    }
+
+    if(a.kind === 'noeffect'){
+      pushMoveLine('↳ NO EFFECT');
+      showPopup('NO EFFECT!');
+    }
+
+  }
+}
+
+// Play frames with per-frame duration (default 1s).
+function scheduleNext(){
+  if(battleIndex >= frames.length){
+    stopBattleTimer();
+    setTimeout(()=>{ hideBattle(); }, 650);
+    return;
+  }
+  renderFrame(battleIndex);
+  const fr = frames[battleIndex];
+  const ms = Math.max(200, Number(fr?.durationMs || 1000));
+  // Tiny gap only (OBS timers can feel "sped up" if we add extra padding per frame).
+  const gap = 60;
+  battleIndex++;
+  battleTimer = setTimeout(scheduleNext, ms + gap);
+}
+
+stopBattleTimer();
+battleIndex = 0;
+scheduleNext();
+    }
+
+
+    function tickBar(){
+      try{
+        if(!currentSpawn || !currentSpawn.spawnedAt || !currentSpawn.expiresAt){ requestAnimationFrame(tickBar); return; }
+        const start = new Date(currentSpawn.spawnedAt).getTime();
+        const end = new Date(currentSpawn.expiresAt).getTime();
+        const now = Date.now();
+        const pct = Math.max(0, Math.min(1, (end-now)/(end-start)));
+        bar.style.transform = 'scaleX(' + pct + ')';
+        requestAnimationFrame(tickBar);
+      }catch(e){ requestAnimationFrame(tickBar); }
+    }
+    tickBar();
+
+    // Sound is disabled for now.
+
+    // --- Overlay event transport ---
+    // Prefer WebSocket, but fall back to polling (some OBS environments block WS upgrades).
+    let lastId = 0;
+    let pollTimer = null;
+
+    function handleOverlayMsg(msg){
+      try{
+        if(msg && msg._id) lastId = Math.max(lastId, Number(msg._id) || 0);
+        if(msg.type === "spawn") { hideBattle(); show(msg.spawn); }
+        if(msg.type === "battle" && msg.battle) playBattle(msg.battle);
+        if(msg.type === "clear") { hideBattle(); clear(); }
+        if(msg.type === "despawn") { hideBattle(); despawn(); }
+        if(msg.type === "caught") caught(msg.trainer || "Someone", msg.pokemon || "a Pokémon", !!msg.isShiny, msg.sprite || null);
+        // sound_settings intentionally ignored (sound disabled)
+      }catch{}
+    }
+
+    async function poll(){
+      try{
+        const r = await fetch('/overlay/poll?since=' + encodeURIComponent(String(lastId)));
+        const j = await r.json();
+        const evs = Array.isArray(j?.events) ? j.events : [];
+        for(const ev of evs) handleOverlayMsg(ev);
+      }catch{}
+    }
+
+    function startPolling(){
+      if(pollTimer) return;
+      poll();
+      pollTimer = setInterval(poll, 500);
+    }
+
+    function stopPolling(){
+      if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    try{
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(proto + '://' + location.host + '/overlay/ws');
+      ws.onopen = ()=>{ stopPolling(); };
+      ws.onmessage = (e)=>{
+        try{ handleOverlayMsg(JSON.parse(e.data)); }catch{}
+      };
+      ws.onerror = ()=>{ startPolling(); };
+      ws.onclose = ()=>{ startPolling(); };
+      // If WS doesn't connect quickly, start polling anyway.
+      setTimeout(()=>{ try{ if(ws.readyState !== 1) startPolling(); }catch{} }, 1200);
+    }catch{
+      startPolling();
+    }
+  </script>
+</body>
+</html>`;
+
   res.status(200).type("html").send(html);
 });
 
@@ -550,15 +1433,254 @@ app.post("/admin/spawn", async (req, res) => {
 });
 
 // ---------- Kick chat command handler ----------
+// Per-user anti-spam cooldown for ALL bot commands.
+// Any command puts that user on cooldown for any other command.
+// Default: 2 seconds.
+const COMMAND_COOLDOWN_MS = envInt("COMMAND_COOLDOWN_MS", 2000);
+const lastCommandAt = new Map();
+
+// ---------- Battle queue (prevents overlapping overlay battles) ----------
+let battleBusy = false;
+const battleQueue = [];
+
+function sleep(ms){
+  return new Promise((r) => setTimeout(r, Math.max(0, Number(ms) || 0)));
+}
+
+async function processBattleQueue(){
+  if (battleBusy) return;
+  const task = battleQueue.shift();
+  if (!task) return;
+  battleBusy = true;
+  try {
+    await task();
+  } catch (e) {
+    console.error("battleQueue task error:", e);
+  }
+  battleBusy = false;
+  // Small gap so overlay has time to clear between battles.
+  await sleep(250);
+  processBattleQueue();
+}
+
+async function enqueueBattle(taskFn){
+  battleQueue.push(taskFn);
+  processBattleQueue();
+  return battleQueue.length; // position after enqueue
+}
+
+async function runWildBattle(username, userId){
+  const result = await game.battleActiveSpawn({ username, platformUserId: userId });
+  if (!result.ok) {
+    if (result.reason === "no_spawn") {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`No Pokémon active right now.`); } catch {}
+    }
+    if (result.reason === "no_team") {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — you have no caught Pokémon to battle with yet. Catch something first!`); } catch {}
+    }
+    // already_caught or other: silent
+    return;
+  }
+
+  const s = result.spawn;
+  const shinyTag = s.isShiny ? " ✨SHINY✨" : "";
+  const lvlTag = s.level ? `Lv. ${s.level} ` : "";
+
+  const framesAll = (result.events || result.simEvents || result.frames || []);
+  const frames = Array.isArray(framesAll) ? framesAll.slice(0, 140) : [];
+
+  // Pause despawn timer during battle playback (wild only) by extending expiresAt.
+  try {
+    const spawn = result.spawn;
+    if (spawn && spawn.id && !spawn.caughtAt) {
+      const durMs = frames.reduce((acc, f) => acc + (Number(f?.durationMs) || 1000) + 60, 0);
+      const safetyMs = 2000;
+      const minExpiresAt = new Date(Date.now() + durMs + safetyMs);
+      const curExpiresAt = new Date(spawn.expiresAt);
+      if (curExpiresAt.getTime() < minExpiresAt.getTime()) {
+        const updated = await prisma.spawn.update({ where: { id: spawn.id }, data: { expiresAt: minExpiresAt } });
+        if (overlayLastSpawn && overlayLastSpawn.id === updated.id) {
+          overlayLastSpawn = updated;
+          overlayBroadcast(overlayEventFromSpawn(updated));
+        }
+      }
+    }
+  } catch {}
+
+  // Overlay battle
+  try {
+    overlayBroadcast({
+      type: "battle",
+      battle: {
+        trainer: username,
+        user: {
+          name: result.userMon?.name || "Your Pokémon",
+          level: result.userMon?.level || undefined,
+          sprite: spriteUrlForName(result.userMon?.name),
+          hp: result.userMon?.maxHP ? result.userMon?.hp : undefined,
+          maxHP: result.userMon?.maxHP
+        },
+        foe: {
+          name: s.pokemon,
+          level: s.level || 5,
+          sprite: spriteUrlForSpawn(s),
+          isShiny: !!s.isShiny,
+          tier: s.tier
+        },
+        frames
+      }
+    });
+  } catch {}
+
+  // Chat pacing (keep readable; plus a kill-feed style finish)
+  const evs = Array.isArray(result.events) ? result.events : [];
+  const turnLines = evs
+    .filter(e => {
+      const k = e?.action?.kind;
+      return !!k && ["start","sendout","use","miss","noeffect","faint","status_inflict","status_tick"].includes(k);
+    })
+    .map(e => String(e.text || "").trim())
+    .filter(Boolean)
+    .slice(0, 7);
+
+  const battleMs = Math.min(15000, Math.max(2500, frames.reduce((acc,f)=>acc + (Number(f?.durationMs)||1000), 0) + 600));
+
+  try {
+    await refreshKickTokenIfNeeded();
+    await sendKickChatMessage(`⚔️ ${username} sent out ${result.userMon.name} vs ${lvlTag}${s.pokemon}${shinyTag}!`.trim());
+  } catch {}
+
+  const playback = turnLines.slice(0, 6);
+  for (let i = 0; i < playback.length; i++) {
+    setTimeout(async () => {
+      try { await sendKickChatMessage(playback[i]); } catch {}
+    }, 1000 * (i + 1));
+  }
+
+  setTimeout(async () => {
+    try {
+      if (result.result === 'lost') {
+        await sendKickChatMessage(`💥 ${lvlTag}${s.pokemon}${shinyTag} KO’d ${username}'s ${result.userMon.name}!`.trim());
+      } else {
+        await sendKickChatMessage(`🔥 ${username}'s ${result.userMon.name} KO’d ${lvlTag}${s.pokemon}${shinyTag}! (+${result.catch.pointsEarned} pts)`.trim());
+      }
+    } catch {}
+  }, battleMs);
+
+  // If the user won, delay caught animation until after the battle.
+  setTimeout(() => {
+    try {
+      if (result.result === "won") {
+        overlayBroadcast({ type: "caught", spawnId: s.id, trainer: username, pokemon: s.pokemon, isShiny: !!s.isShiny, sprite: spriteUrlForSpawn(s) });
+        overlayBroadcast({ type: "clear" });
+        overlayLastSpawn = null;
+      } else {
+        overlayBroadcast(overlayEventFromSpawn(overlayLastSpawn));
+      }
+    } catch {}
+  }, battleMs);
+
+  // Block queue until animation likely finished so battles don't overlap.
+  await sleep(battleMs + 900);
+}
+
+async function runDuelBattle(req, accepterName, accepterUserId){
+  // Resolve users
+  const challengerUser = await game.getOrCreateKickUser(req.challengerName, req.challengerPlatformUserId);
+  const opponentUser = await game.getOrCreateKickUser(accepterName, accepterUserId);
+
+  const result = await game.battleTrainers({
+    challengerUserId: challengerUser.id,
+    challengerName: req.challengerName,
+    opponentUserId: opponentUser.id,
+    opponentName: accepterName
+  });
+  if (!result.ok) {
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`Both trainers need at least one caught Pokémon to duel.`); } catch {}
+    return;
+  }
+
+  const framesAll = (result.events || []);
+  const frames = framesAll.slice(0, 140);
+
+  // Overlay
+  try {
+    overlayBroadcast({
+      type: "battle",
+      battle: {
+        trainer: `${req.challengerName} vs ${accepterName}`,
+        user: {
+          name: result.challengerMon?.name || "Trainer",
+          level: result.challengerMon?.level || undefined,
+          sprite: spriteUrlForName(result.challengerMon?.name),
+          maxHP: result.challengerMon?.maxHP,
+          hp: result.challengerMon?.hp
+        },
+        foe: {
+          name: result.opponentMon?.name || "Trainer",
+          level: result.opponentMon?.level || undefined,
+          sprite: spriteUrlForName(result.opponentMon?.name),
+          isShiny: false,
+          tier: "trainer"
+        },
+        frames
+      }
+    });
+  } catch {}
+
+  const duelMs = Math.min(18000, Math.max(3500, frames.reduce((acc,f)=>acc + (Number(f?.durationMs)||1000), 0) + 600));
+
+  try {
+    await refreshKickTokenIfNeeded();
+    await sendKickChatMessage(`⚔️ DUEL! ${req.challengerName} (${result.challengerMon.name}) vs ${accepterName} (${result.opponentMon.name})`);
+  } catch {}
+
+  setTimeout(async () => {
+    try {
+      const winner = result.result === "challenger" ? req.challengerName : accepterName;
+      const loser = result.result === "challenger" ? accepterName : req.challengerName;
+      await sendKickChatMessage(`🏁 ${winner} KO’d ${loser} — duel win!`);
+    } catch {}
+  }, duelMs);
+
+  await sleep(duelMs + 900);
+}
+
 async function handleChat({ username, userId, content }) {
   const msg = String(content || "").trim();
   if (!msg.startsWith(PREFIX)) return;
 
+  // Global per-user command cooldown (anti-spam)
+  const cdKey = userId ? `kick:${String(userId)}` : `kick:${String(username || "").toLowerCase()}`;
+  const now = Date.now();
+  const last = lastCommandAt.get(cdKey) || 0;
+  if (now - last < COMMAND_COOLDOWN_MS) return;
+  lastCommandAt.set(cdKey, now);
+
   const lower = msg.toLowerCase();
 
-  // !catch <name>
-  if (lower.startsWith(`${PREFIX}catch `)) {
-    const guess = msg.slice(`${PREFIX}catch `.length);
+  // !pokehelp (player command list)
+  if (lower === `${PREFIX}pokehelp` || lower === `${PREFIX}help` || lower === `${PREFIX}commands`) {
+    try {
+      await refreshKickTokenIfNeeded();
+
+      // Keep messages short to avoid spam / truncation.
+      await sendKickChatMessage(
+        `📘 PokeHelp — Core: ${PREFIX}catch | ${PREFIX}battle | ${PREFIX}duel | ${PREFIX}use <pokemon> | ${PREFIX}heal [pokemon] (250 LP)`
+      );
+      await sendKickChatMessage(
+        `📦 Info: ${PREFIX}inv | ${PREFIX}top | ${PREFIX}pokedex | ${PREFIX}bet <amount> | ${PREFIX}pokehelp`
+      );
+      await sendKickChatMessage(
+        `⚔️ Duels: ${PREFIX}duel @user → ${PREFIX}accept / ${PREFIX}decline (queued so battles finish first)`
+      );
+    } catch {}
+    return;
+  }
+
+  // !catch  (optional: !catch <name>)
+  if (lower === `${PREFIX}catch` || lower.startsWith(`${PREFIX}catch `)) {
+    const guess = lower === `${PREFIX}catch` ? "" : msg.slice(`${PREFIX}catch `.length);
     const result = await game.tryCatch({
       username,
       platformUserId: userId,
@@ -566,6 +1688,7 @@ async function handleChat({ username, userId, content }) {
     });
 
     if (!result.ok) {
+      // Wrong name: stay silent to avoid chat spam
       if (result.reason === "wrong_name") return;
 
       if (result.reason === "no_spawn") {
@@ -578,7 +1701,7 @@ async function handleChat({ username, userId, content }) {
 
       if (result.reason === "already_caught") return;
 
-      // NEW: catch failed (correct name but it broke free)
+      // Catch failed (broke free)
       if (result.reason === "catch_failed") {
         const pct = typeof result.chance === "number" ? Math.round(result.chance * 100) : null;
         try {
@@ -608,8 +1731,20 @@ async function handleChat({ username, userId, content }) {
       console.error("sendKickChatMessage failed:", e?.message || e);
     }
 
-    // Clear OBS overlay once caught
-    
+    // Notify overlay: stop looping sound + show catch animation
+    try {
+      overlayBroadcast({
+        type: "caught",
+        spawnId: s.id,
+        trainer: username,
+        pokemon: s.pokemon,
+        isShiny: !!s.isShiny,
+        sprite: spriteUrlForSpawn(s)
+      });
+      overlayBroadcast({ type: "clear" });
+      overlayLastSpawn = null;
+    } catch {}
+
     return;
   }
 
@@ -634,6 +1769,33 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
+  // !pokelb (Pokémon catches leaderboard)
+  if (lower === `${PREFIX}pokelb` || lower === `${PREFIX}pokemonlb`) {
+    const rows = await prisma.catch.groupBy({
+      by: ["userId"],
+      _count: { _all: true },
+      orderBy: { _count: { _all: "desc" } },
+      take: 10
+    });
+    if (!rows.length) {
+      try {
+        await refreshKickTokenIfNeeded();
+        await sendKickChatMessage("No catches yet.");
+      } catch {}
+      return;
+    }
+    const users = await prisma.user.findMany({ where: { id: { in: rows.map(r => r.userId) } } });
+    const uMap = new Map(users.map(u => [u.id, u]));
+    const line = rows
+      .map((r, i) => `${i + 1}. ${(uMap.get(r.userId)?.displayName || "unknown")}: ${r._count._all}`)
+      .join(" | ");
+    try {
+      await refreshKickTokenIfNeeded();
+      await sendKickChatMessage(`📦 Catch Leaderboard — ${line}`);
+    } catch {}
+    return;
+  }
+
   // !me
   if (lower === `${PREFIX}me`) {
     const stats = await game.userStats(username);
@@ -652,6 +1814,288 @@ async function handleChat({ username, userId, content }) {
     } catch (e) {
       console.error("sendKickChatMessage failed:", e?.message || e);
     }
+    return;
+  }
+
+  // !inventory (recent catches)  /  !inv
+  if (lower === `${PREFIX}inventory` || lower === `${PREFIX}inv`) {
+    const user = await game.getOrCreateKickUser(username, userId);
+    const leaderPts = await getLeaderPoints(user.id);
+    const recent = await prisma.catch.findMany({
+      where: { userId: user.id },
+      orderBy: { caughtAt: "desc" },
+      take: 8
+    });
+    if (!recent.length) {
+      try {
+        await refreshKickTokenIfNeeded();
+        await sendKickChatMessage(`${username} — no catches yet. LeaderPts: ${leaderPts}`);
+      } catch {}
+      return;
+    }
+    const list = recent
+      .map((c) => `${c.isShiny ? "✨" : ""}${c.pokemon}${c.level ? " Lv." + c.level : ""}`)
+      .join(", ");
+    const baseUrl = process.env.PUBLIC_BASE_URL;
+    const invLink = baseUrl ? `${baseUrl.replace(/\/$/, "")}/trainer/${String(username).toLowerCase()}` : null;
+    try {
+      await refreshKickTokenIfNeeded();
+      await sendKickChatMessage(`🎒 ${username} — LeaderPts: ${leaderPts} | Recent: ${list}${invLink ? " | Full: " + invLink : ""}`);
+    } catch {}
+    return;
+  }
+
+  
+// !heal [pokemon]  (spend LeaderPoints to heal a Pokémon to full; HP persists between battles)
+if (lower === `${PREFIX}heal` || lower.startsWith(`${PREFIX}heal `)) {
+  const arg = msg.split(/\s+/).slice(1).join(" ").trim();
+  const user = await game.getOrCreateKickUser(username, userId);
+
+  const cost = envInt("HEAL_COST_LP", 250);
+  const leaderPts = await getLeaderPoints(user.id);
+  if (leaderPts < cost) {
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`🧪 ${username} — you need ${cost} LeaderPts to heal (you have ${leaderPts}).`); } catch {}
+    return;
+  }
+
+  // Pick target Pokémon instance to heal:
+  // - If arg provided: heal your highest level of that species (or by catch id if you paste it)
+  // - Otherwise: heal your currently selected battle Pokémon (via !use), or your highest level catch
+  let target = null;
+  if (arg) {
+    const rows = await prisma.catch.findMany({
+      where: { userId: user.id },
+      orderBy: [{ level: "desc" }, { caughtAt: "desc" }],
+      take: 200
+    });
+    const a = arg.toLowerCase();
+    target = rows.find((r) => String(r.id).toLowerCase() === a) ||
+             rows.find((r) => String(r.pokemon || "").toLowerCase() === a) ||
+             null;
+  } else {
+    const sel = await game.getUserBattleMon(user.id);
+    target = sel?.catchRow || null;
+  }
+
+  if (!target) {
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`🧪 ${username} — you don't have any Pokémon to heal yet.`); } catch {}
+    return;
+  }
+
+  const maxHp = Number(target.maxHp || 0);
+  if (!Number.isFinite(maxHp) || maxHp <= 0) {
+    // Backfill max HP if older catches existed before HP persistence was added
+    const rebuilt = require("./battle").buildBattleMonFromDex({ nameOrId: target.pokemon, level: target.level || 5 });
+    const mhp = Number(rebuilt?.stats?.hp || 1);
+    await prisma.catch.update({ where: { id: target.id }, data: { maxHp: mhp, currentHp: mhp } }).catch(() => {});
+  } else {
+    await prisma.catch.update({ where: { id: target.id }, data: { currentHp: maxHp } }).catch(() => {});
+  }
+
+  // Deduct currency via adjustment
+  const adj = await getLpAdj(user.id);
+  await setLpAdj(user.id, adj - cost);
+
+  try {
+    await refreshKickTokenIfNeeded();
+    await sendKickChatMessage(`💚 ${username} healed ${target.isShiny ? "✨" : ""}${target.pokemon}${target.level ? " Lv." + target.level : ""} to full for ${cost} LeaderPts!`);
+  } catch {}
+  return;
+}
+
+// !use <pokemon>  (sets your active battle Pokémon; picks your highest level of that species)
+  if (lower === `${PREFIX}use` || lower.startsWith(`${PREFIX}use `) || lower === `${PREFIX}pick` || lower.startsWith(`${PREFIX}pick `)) {
+    const arg = msg.split(/\s+/).slice(1).join(" ").trim();
+    const user = await game.getOrCreateKickUser(username, userId);
+    if (!arg) {
+      await game.setActivePokemon(user.id, "");
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — active battle Pokémon cleared. I'll use your highest level catch by default.`); } catch {}
+      return;
+    }
+
+    // Verify they actually own it (at least one catch)
+    const owned = await prisma.catch.findFirst({ where: { userId: user.id, pokemon: { equals: arg, mode: "insensitive" } } });
+    if (!owned) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — you don't have a ${arg} yet. Catch one first!`); } catch {}
+      return;
+    }
+
+    await game.setActivePokemon(user.id, arg);
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — set active battle Pokémon to ${owned.pokemon}${owned.level ? ` (best Lv.${owned.level})` : ""}.`); } catch {}
+    return;
+  }
+
+  // !battle  (fight the current spawn with your selected Pokémon; 1v1 for now)
+  if (lower === `${PREFIX}battle` || lower === `${PREFIX}fight`) {
+    const wasBusy = battleBusy || battleQueue.length > 0;
+    const pos = await enqueueBattle(() => runWildBattle(username, userId));
+    if (wasBusy) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`⏳ ${username} joined the battle queue (#${pos}).`); } catch {}
+    }
+    return;
+  }
+
+  // ---- Trainer vs Trainer battles ----
+  // !duel <username>   (challenge another chatter)
+  // !accept            (accept a pending duel)
+  // !decline           (decline a pending duel)
+  if (lower.startsWith(`${PREFIX}duel`) || lower.startsWith(`${PREFIX}pvp`) || lower.startsWith(`${PREFIX}challenge`)) {
+    const target = msg.split(/\s+/).slice(1).join(" ").trim();
+    if (!target) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`Usage: ${PREFIX}duel <username>`); } catch {}
+      return;
+    }
+    const targetHandle = String(target).replace(/^@/, "").trim().toLowerCase();
+    const selfHandle = String(username || "").trim().toLowerCase();
+    if (!targetHandle || targetHandle === selfHandle) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — choose another user to duel.`); } catch {}
+      return;
+    }
+
+    // Ensure the target exists in our DB (has chatted before)
+    const targetIdent = await prisma.userIdentity.findUnique({ where: { platform_handle: { platform: "kick", handle: targetHandle } } }).catch(() => null);
+    if (!targetIdent) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — I don't see @${targetHandle} yet. They need to chat once first.`); } catch {}
+      return;
+    }
+
+    duelRequests.set(targetHandle, {
+      challengerHandle: selfHandle,
+      challengerName: username,
+      challengerPlatformUserId: userId,
+      createdAt: Date.now()
+    });
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`⚔️ @${targetHandle}, ${username} challenged you to a duel! Type ${PREFIX}accept to fight (60s).`); } catch {}
+    return;
+  }
+
+  if (lower === `${PREFIX}decline`) {
+    const selfHandle = String(username || "").trim().toLowerCase();
+    const req = duelRequests.get(selfHandle);
+    if (req) duelRequests.delete(selfHandle);
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} declined the duel.`); } catch {}
+    return;
+  }
+
+  if (lower === `${PREFIX}accept`) {
+    const selfHandle = String(username || "").trim().toLowerCase();
+    const req = duelRequests.get(selfHandle);
+    if (!req) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — no duel request found. Ask someone to ${PREFIX}duel you.`); } catch {}
+      return;
+    }
+    if (Date.now() - req.createdAt > DUEL_TTL_MS) {
+      duelRequests.delete(selfHandle);
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`That duel request expired.`); } catch {}
+      return;
+    }
+    duelRequests.delete(selfHandle);
+
+    // Queue the duel so ongoing battles can finish before this one starts.
+    const wasBusy = battleBusy || battleQueue.length > 0;
+    const reqCopy = Object.assign({}, req);
+    const pos = await enqueueBattle(() => runDuelBattle(reqCopy, username, userId));
+    if (wasBusy) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`⏳ Duel queued (#${pos}): ${reqCopy.challengerName} vs ${username}`); } catch {}
+    }
+    return;
+  }
+
+  // !bet <amount>  (alias: !wager)
+  // Instant wager: deduct leaderpoints, then immediately attempt to catch the current spawn.
+  if (lower.startsWith(`${PREFIX}bet`) || lower.startsWith(`${PREFIX}wager`)) {
+    const parts = msg.trim().split(/\s+/);
+    const amt = Math.floor(Number(parts[1] || 0));
+    if (!Number.isFinite(amt) || amt <= 0) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`Usage: ${PREFIX}bet <amount>`); } catch {}
+      return;
+    }
+
+    const spawn = await game.getActiveSpawn();
+    if (!spawn) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage("No Pokémon active to bet on."); } catch {}
+      return;
+    }
+
+    const user = await game.getOrCreateKickUser(username, userId);
+    const bal = await getLeaderPoints(user.id);
+    if (amt > bal) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — not enough LeaderPts. Balance: ${bal}`); } catch {}
+      return;
+    }
+
+    // Deduct wager upfront
+    await addLpAdj(user.id, -amt);
+
+    // Attempt catch (no name required)
+    const result = await game.tryCatch({
+      username,
+      platformUserId: userId,
+      guessName: ""
+    });
+
+    if (!result.ok) {
+      // Refund only if there wasn't an active spawn anymore / race condition.
+      if (result.reason === "no_spawn" || result.reason === "already_caught") {
+        await addLpAdj(user.id, amt);
+        try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — too late! Someone else got it. Bet refunded.`); } catch {}
+        return;
+      }
+
+      if (result.reason === "catch_failed") {
+        const pct = typeof result.chance === "number" ? Math.round(result.chance * 100) : null;
+        try {
+          await refreshKickTokenIfNeeded();
+          await sendKickChatMessage(
+            pct
+              ? `${username} bet ${amt} LeaderPts and it broke free! (lost bet) — (${pct}% catch chance)`
+              : `${username} bet ${amt} LeaderPts and it broke free! (lost bet)`
+          );
+        } catch {}
+        return;
+      }
+
+      // Other failure: refund
+      await addLpAdj(user.id, amt);
+      return;
+    }
+
+    const s = result.spawn;
+    const shinyTag = s.isShiny ? " ✨SHINY✨" : "";
+    const lvlTag = s.level ? `Lv. ${s.level} ` : "";
+
+    const mult = payoutMultiplierForSpawn(s);
+    const payout = Math.max(0, Math.floor(amt * mult));
+    await addLpAdj(user.id, payout);
+
+    try {
+      await refreshKickTokenIfNeeded();
+      await sendKickChatMessage(
+        `${username} bet ${amt} LeaderPts and caught ${lvlTag}${s.pokemon}${shinyTag}! +${payout} LeaderPts payout (x${mult.toFixed(2)}) + ${result.catch.pointsEarned} catch pts.`
+      );
+    } catch {}
+
+    // Notify overlay
+    try {
+      overlayBroadcast({
+        type: "caught",
+        spawnId: s.id,
+        trainer: username,
+        pokemon: s.pokemon,
+        isShiny: !!s.isShiny,
+        sprite: spriteUrlForSpawn(s)
+      });
+      overlayBroadcast({ type: "clear" });
+      overlayLastSpawn = null;
+    } catch {}
+
+    return;
+  }
+
+  // Sound controls are disabled for now.
+  if (lower.startsWith(`${PREFIX}sound`)) {
+    if (String(username || "").toLowerCase() !== STREAMER_USERNAME) return;
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage("🔇 Overlay sounds are currently disabled."); } catch {}
     return;
   }
 
@@ -695,6 +2139,8 @@ const server = app.listen(PORT, () => {
         try {
           const spawn = overlayLastSpawn || (await game.getActiveSpawn());
           ws.send(JSON.stringify(overlayEventFromSpawn(spawn)));
+          const settings = await getSoundSettings(PRIMARY_CHANNEL);
+          ws.send(JSON.stringify({ type: "sound_settings", settings }));
         } catch {
           try { ws.send(JSON.stringify({ type: 'clear' })); } catch {}
         }
