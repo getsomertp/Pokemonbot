@@ -104,22 +104,19 @@ class Game {
     level = Math.max(this.levelMin, Math.min(this.levelMax, level));
 
     const stats = dex.computeStats(p.baseStats, level);
-    const moveIds = dex.getMovesForLevel(p, level);
-
-    // store move objects (name/power/accuracy/type/etc) for quick use later
-    const moves = moveIds
-      .map((id) => p.moves?.[id])
-      .filter(Boolean)
-      .map((m) => ({
-        id: m.id,
-        name: m.name,
-        power: m.power,
-        accuracy: m.accuracy,
-        pp: m.pp,
-        type: m.type,
-        damageClass: m.damageClass,
-        priority: m.priority
-      }));
+    // dex.getMovesForLevel() already returns fully-populated move objects.
+    // (Previous builds treated these as IDs, which resulted in empty wild movesets.
+    //  That made wild Pokémon never take a turn.)
+    const moves = (dex.getMovesForLevel(p, level) || []).map((m) => ({
+      id: m.id,
+      name: m.name,
+      power: m.power,
+      accuracy: m.accuracy,
+      pp: m.pp,
+      type: m.type,
+      damageClass: m.damageClass,
+      priority: m.priority
+    }));
 
     const spawnedAt = new Date();
     const expiresAt = new Date(spawnedAt.getTime() + this.despawnSeconds * 1000);
@@ -344,6 +341,7 @@ class Game {
     if (!userMon) return { ok: false, reason: "no_team" };
 
     // Build wild mon from stored spawn stats/moves if available, else from dex.
+    // NOTE: Prisma JSON fields can contain empty arrays/objects; treat those as "missing".
     const wild = {
       name: spawn.pokemon,
       level: spawn.level || 5,
@@ -351,7 +349,9 @@ class Game {
       stats: spawn.statsJson || null,
       moves: spawn.movesJson || null
     };
-    if (!wild.stats || !wild.moves) {
+    const hasStats = !!wild.stats && typeof wild.stats === "object" && Number(wild.stats.hp || 0) > 0;
+    const hasMoves = Array.isArray(wild.moves) && wild.moves.length > 0;
+    if (!hasStats || !hasMoves) {
       const rebuilt = buildBattleMonFromDex({ nameOrId: spawn.pokemonId || spawn.pokemon, level: spawn.level || 5 });
       if (rebuilt) {
         wild.types = rebuilt.types;
