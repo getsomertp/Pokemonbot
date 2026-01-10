@@ -41,6 +41,11 @@ const STREAMER_USERNAME = (process.env.STREAMER_USERNAME || PRIMARY_CHANNEL || "
 
 const game = new Game();
 
+// ---- Trainer vs Trainer duels (in-memory challenge/accept) ----
+// Map: opponentHandleLower -> { challengerHandleLower, challengerName, challengerPlatformUserId, createdAt }
+const duelRequests = new Map();
+const DUEL_TTL_MS = 60 * 1000; // 60s to accept
+
 // ---- Readiness / health (helps avoid Railway 502 confusion) ----
 let READY = false;
 let BOOT_ERROR = null;
@@ -730,7 +735,6 @@ app.get("/overlay", (req, res) => {
     /* Small move log */
     #moveLog{position:absolute; left:22px; right:22px; bottom:92px; padding:10px 12px; border-radius:14px; background:rgba(0,0,0,0.45); backdrop-filter:blur(6px); font-size:13px; line-height:1.25; max-height:76px; overflow:hidden;}
     #moveLog .line{opacity:0.95; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
-    #unlock{position:absolute; left:50%; top:16px; transform:translateX(-50%); display:none; padding:10px 14px; border-radius:12px; border:0; background:rgba(0,0,0,0.65); color:white; font-family:system-ui; font-size:14px; cursor:pointer;}
     ${showUi ? '#ui{position:absolute; right:16px; bottom:16px; background:rgba(0,0,0,0.5); color:white; padding:12px; border-radius:12px; font-family:system-ui;}' : '#ui{display:none;}'}
   </style>
 </head>
@@ -768,13 +772,6 @@ app.get("/overlay", (req, res) => {
     </div>
 
     <div id="toast"></div>
-    <button id="unlock">Click to enable battle sound</button>
-    <div id="ui">
-      <div><b>Sound</b>: <span id="uiEnabled">?</span></div>
-      <div>Vol: <span id="uiVol">?</span></div>
-      <input id="uiSlider" type="range" min="0" max="100" value="50" style="width:220px"/>
-    </div>
-    <audio id="loop" src="/sounds/wild_battle.mp3" loop preload="auto"></audio>
   </div>
 
   <script>
@@ -784,11 +781,6 @@ app.get("/overlay", (req, res) => {
     const metaEl = document.getElementById("meta");
     const bar = document.getElementById("bar");
     const toast = document.getElementById("toast");
-    const unlockBtn = document.getElementById("unlock");
-    const audioEl = document.getElementById("loop");
-    const uiEnabled = document.getElementById("uiEnabled");
-    const uiVol = document.getElementById("uiVol");
-    const uiSlider = document.getElementById("uiSlider");
 
     const battleEl = document.getElementById("battle");
     const battleText = document.getElementById("battleText");
@@ -809,65 +801,6 @@ app.get("/overlay", (req, res) => {
     let battleIndex = 0;
 
     let currentSpawn = null;
-    let soundEnabled = true;
-    let targetVolume = 0.5;
-
-    // WebAudio for smooth fade-out
-    let ctx = null, src = null, gain = null;
-    function ensureAudioGraph(){
-      if(ctx) return;
-      try{
-        ctx = new (window.AudioContext || window.webkitAudioContext)();
-        src = ctx.createMediaElementSource(audioEl);
-        gain = ctx.createGain();
-        gain.gain.value = targetVolume;
-        src.connect(gain).connect(ctx.destination);
-      }catch(e){ ctx=null; }
-    }
-
-    function setVol(v){
-      targetVolume = Math.max(0, Math.min(1, v));
-      if(gain && ctx){ try{ gain.gain.setValueAtTime(targetVolume, ctx.currentTime); }catch{} }
-      audioEl.volume = targetVolume;
-      if(uiVol) uiVol.textContent = Math.round(targetVolume*100)+"%";
-      if(uiSlider && document.getElementById("ui").style.display!=="none") uiSlider.value = String(Math.round(targetVolume*100));
-    }
-
-    function setEnabled(en){
-      soundEnabled = !!en;
-      if(uiEnabled) uiEnabled.textContent = soundEnabled ? "ON" : "OFF";
-      if(!soundEnabled) fadeOutAndStop(150);
-      else if(currentSpawn) startLoop();
-    }
-
-    async function startLoop(){
-      if(!soundEnabled) return;
-      try{ ensureAudioGraph(); if(ctx && ctx.state==="suspended") await ctx.resume(); }catch{}
-      try{
-        audioEl.currentTime = 0;
-        audioEl.volume = targetVolume;
-        if(gain && ctx){ gain.gain.cancelScheduledValues(ctx.currentTime); gain.gain.setValueAtTime(targetVolume, ctx.currentTime); }
-        await audioEl.play();
-        if(unlockBtn) unlockBtn.style.display = "none";
-      }catch(e){
-        if(unlockBtn) unlockBtn.style.display = "block";
-      }
-    }
-
-    function fadeOutAndStop(ms){
-      try{
-        if(gain && ctx){
-          const t = ctx.currentTime;
-          gain.gain.cancelScheduledValues(t);
-          gain.gain.setValueAtTime(gain.gain.value, t);
-          gain.gain.linearRampToValueAtTime(0.0001, t + (ms/1000));
-          setTimeout(()=>{ try{ audioEl.pause(); audioEl.currentTime = 0; gain.gain.setValueAtTime(targetVolume, ctx.currentTime);}catch{} }, ms+40);
-        } else {
-          const start = audioEl.volume; const steps = 10; let i=0;
-          const int = setInterval(()=>{ i++; audioEl.volume = Math.max(0, start*(1-i/steps)); if(i>=steps){ clearInterval(int); audioEl.pause(); audioEl.currentTime=0; audioEl.volume=targetVolume;} }, Math.max(16, Math.floor(ms/steps)));
-        }
-      }catch(e){ try{ audioEl.pause(); audioEl.currentTime=0; }catch{} }
-    }
 
     function show(spawn){
       if(!spawn || !spawn.sprite) return;
@@ -878,10 +811,9 @@ app.get("/overlay", (req, res) => {
       metaEl.textContent = 'Lv. ' + spawn.level + ' • ' + spawn.tier;
       card.style.display = "flex";
       card.classList.remove("pop"); void card.offsetWidth; card.classList.add("pop");
-      startLoop();
     }
 
-    function clear(){ currentSpawn=null; card.style.display = "none"; if(unlockBtn) unlockBtn.style.display="none"; fadeOutAndStop(650); }
+    function clear(){ currentSpawn=null; card.style.display = "none"; }
     function caught(trainer, pokemon, isShiny){ toast.textContent = '🎮 ' + trainer + ' caught ' + (isShiny ? '✨ ' : '') + pokemon + '!'; toast.classList.remove("show"); void toast.offsetWidth; toast.classList.add("show"); clear(); }
     function despawn(){ clear(); }
 
@@ -920,6 +852,10 @@ app.get("/overlay", (req, res) => {
       void popup.offsetWidth;
       popup.classList.add("show");
     }
+
+    // --- Battle SFX ---
+    // Disabled for now (no click-to-unlock and no sound effects).
+    function playSfx(){ /* disabled */ }
 
     function pushMoveLine(line){
       if(!moveLog || !line) return;
@@ -1041,6 +977,11 @@ function renderFrame(i){
       pulse(defSprite, 'shake');
       pulse(defSprite, 'hitFlash');
 
+      // Hit SFX
+      playSfx('hit');
+      if(a.crit) playSfx('crit');
+      if(a.mult >= 2) playSfx('super');
+
       // Add a compact summary to the move log (damage + tags)
       const dmg = (a.damage != null) ? (' -' + a.damage) : '';
       let effTag = '';
@@ -1059,6 +1000,24 @@ function renderFrame(i){
       else if(a.crit) showPopup('CRITICAL HIT!');
     }
 
+    if(a.kind === 'status_inflict'){
+      // Status applied message (text already shows). Add a quick popup + log.
+      const st = String(a.status || '').toLowerCase();
+      if(st === 'burn') showPopup('BURNED!');
+      else if(st === 'poison') showPopup('POISONED!');
+      pushMoveLine('↳ ' + (st ? st.toUpperCase() : 'STATUS'));
+      playSfx('status');
+    }
+
+    if(a.kind === 'status_tick'){
+      // DOT tick (text already shows)
+      playSfx('status');
+    }
+
+    if(a.kind === 'faint'){
+      playSfx('faint');
+    }
+
     if(a.kind === 'miss'){
       pushMoveLine('↳ MISS!');
       showPopup('MISS!');
@@ -1068,6 +1027,7 @@ function renderFrame(i){
       pushMoveLine('↳ NO EFFECT');
       showPopup('NO EFFECT!');
     }
+
   }
 }
 
@@ -1106,16 +1066,7 @@ scheduleNext();
     }
     tickBar();
 
-    // unlock audio via click
-    if(unlockBtn){
-      unlockBtn.addEventListener("click", async ()=>{
-        try{ ensureAudioGraph(); if(ctx && ctx.state==="suspended") await ctx.resume(); }catch{}
-        startLoop();
-      });
-    }
-
-    // Optional UI slider (if ?ui=1)
-    if(uiSlider){ uiSlider.oninput = ()=>{ setVol(Number(uiSlider.value)/100); }; }
+    // Sound is disabled for now.
 
     // --- Overlay event transport ---
     // Prefer WebSocket, but fall back to polling (some OBS environments block WS upgrades).
@@ -1130,7 +1081,7 @@ scheduleNext();
         if(msg.type === "clear") { hideBattle(); clear(); }
         if(msg.type === "despawn") { hideBattle(); despawn(); }
         if(msg.type === "caught") caught(msg.trainer || "Someone", msg.pokemon || "a Pokémon", !!msg.isShiny);
-        if(msg.type === "sound_settings" && msg.settings){ setEnabled(msg.settings.enabled); setVol(msg.settings.volume); }
+        // sound_settings intentionally ignored (sound disabled)
       }catch{}
     }
 
@@ -1191,25 +1142,26 @@ app.post("/admin/spawn", async (req, res) => {
 });
 
 // ---------- Kick chat command handler ----------
-// Per-user anti-spam cooldown for catch attempts
-// (prevents users from spamming !catch)
-const CATCH_COOLDOWN_MS = envInt("CATCH_COOLDOWN_MS", 1500);
-const lastCatchAttemptAt = new Map();
+// Per-user anti-spam cooldown for ALL bot commands.
+// Any command puts that user on cooldown for any other command.
+// Default: 2 seconds.
+const COMMAND_COOLDOWN_MS = envInt("COMMAND_COOLDOWN_MS", 2000);
+const lastCommandAt = new Map();
 
 async function handleChat({ username, userId, content }) {
   const msg = String(content || "").trim();
   if (!msg.startsWith(PREFIX)) return;
 
+  // Global per-user command cooldown (anti-spam)
+  const cdKey = userId ? `kick:${String(userId)}` : `kick:${String(username || "").toLowerCase()}`;
+  const now = Date.now();
+  const last = lastCommandAt.get(cdKey) || 0;
+  if (now - last < COMMAND_COOLDOWN_MS) return;
+  lastCommandAt.set(cdKey, now);
+
   const lower = msg.toLowerCase();
   // !catch  (optional: !catch <name>)
   if (lower === `${PREFIX}catch` || lower.startsWith(`${PREFIX}catch `)) {
-    // 1.5s cooldown per user (or override via env CATCH_COOLDOWN_MS)
-    const key = userId ? `kick:${String(userId)}` : `kick:${String(username || "").toLowerCase()}`;
-    const now = Date.now();
-    const last = lastCatchAttemptAt.get(key) || 0;
-    if (now - last < CATCH_COOLDOWN_MS) return;
-    lastCatchAttemptAt.set(key, now);
-
     const guess = lower === `${PREFIX}catch` ? "" : msg.slice(`${PREFIX}catch `.length);
     const result = await game.tryCatch({
       username,
@@ -1419,7 +1371,7 @@ async function handleChat({ username, userId, content }) {
     // Notify overlay: play battle animation.
     try {
       const framesAll = (result.events || result.simEvents || result.frames || []);
-      const frames = framesAll.slice(0, 80); // cap to keep overlay snappy
+      const frames = framesAll.slice(0, 140); // cap to keep overlay snappy
       overlayBroadcast({
         type: "battle",
         battle: {
@@ -1449,7 +1401,7 @@ async function handleChat({ username, userId, content }) {
     const turnLines = evs
   .filter(e => {
     const k = e?.action?.kind;
-    return !!k && ["start","sendout","use","miss","noeffect","faint"].includes(k);
+    return !!k && ["start","sendout","use","miss","noeffect","faint","status_inflict","status_tick"].includes(k);
   })
   .map(e => String(e.text || "").trim())
   .filter(Boolean)
@@ -1504,6 +1456,124 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
+  // ---- Trainer vs Trainer battles ----
+  // !duel <username>   (challenge another chatter)
+  // !accept            (accept a pending duel)
+  // !decline           (decline a pending duel)
+  if (lower.startsWith(`${PREFIX}duel`) || lower.startsWith(`${PREFIX}pvp`) || lower.startsWith(`${PREFIX}challenge`)) {
+    const target = msg.split(/\s+/).slice(1).join(" ").trim();
+    if (!target) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`Usage: ${PREFIX}duel <username>`); } catch {}
+      return;
+    }
+    const targetHandle = String(target).replace(/^@/, "").trim().toLowerCase();
+    const selfHandle = String(username || "").trim().toLowerCase();
+    if (!targetHandle || targetHandle === selfHandle) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — choose another user to duel.`); } catch {}
+      return;
+    }
+
+    // Ensure the target exists in our DB (has chatted before)
+    const targetIdent = await prisma.userIdentity.findUnique({ where: { platform_handle: { platform: "kick", handle: targetHandle } } }).catch(() => null);
+    if (!targetIdent) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — I don't see @${targetHandle} yet. They need to chat once first.`); } catch {}
+      return;
+    }
+
+    duelRequests.set(targetHandle, {
+      challengerHandle: selfHandle,
+      challengerName: username,
+      challengerPlatformUserId: userId,
+      createdAt: Date.now()
+    });
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`⚔️ @${targetHandle}, ${username} challenged you to a duel! Type ${PREFIX}accept to fight (60s).`); } catch {}
+    return;
+  }
+
+  if (lower === `${PREFIX}decline`) {
+    const selfHandle = String(username || "").trim().toLowerCase();
+    const req = duelRequests.get(selfHandle);
+    if (req) duelRequests.delete(selfHandle);
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} declined the duel.`); } catch {}
+    return;
+  }
+
+  if (lower === `${PREFIX}accept`) {
+    const selfHandle = String(username || "").trim().toLowerCase();
+    const req = duelRequests.get(selfHandle);
+    if (!req) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — no duel request found. Ask someone to ${PREFIX}duel you.`); } catch {}
+      return;
+    }
+    if (Date.now() - req.createdAt > DUEL_TTL_MS) {
+      duelRequests.delete(selfHandle);
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`That duel request expired.`); } catch {}
+      return;
+    }
+    duelRequests.delete(selfHandle);
+
+    // Resolve users
+    const challengerUser = await game.getOrCreateKickUser(req.challengerName, req.challengerPlatformUserId);
+    const opponentUser = await game.getOrCreateKickUser(username, userId);
+
+    const result = await game.battleTrainers({
+      challengerUserId: challengerUser.id,
+      challengerName: req.challengerName,
+      opponentUserId: opponentUser.id,
+      opponentName: username
+    });
+
+    if (!result.ok) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`Both trainers need at least one caught Pokémon to duel.`); } catch {}
+      return;
+    }
+
+    // Overlay battle (challenger as "user" side, opponent as "foe" side)
+    try {
+      const framesAll = (result.events || []);
+      const frames = framesAll.slice(0, 140);
+      overlayBroadcast({
+        type: "battle",
+        battle: {
+          trainer: `${req.challengerName} vs ${username}`,
+          user: {
+            name: result.challengerMon?.name || "Trainer",
+            level: result.challengerMon?.level || undefined,
+            sprite: spriteUrlForName(result.challengerMon?.name),
+            maxHP: result.challengerMon?.maxHP,
+            hp: result.challengerMon?.hp
+          },
+          foe: {
+            name: result.opponentMon?.name || "Trainer",
+            level: result.opponentMon?.level || undefined,
+            sprite: spriteUrlForName(result.opponentMon?.name),
+            isShiny: false,
+            tier: "trainer"
+          },
+          frames
+        }
+      });
+    } catch {}
+
+    // Chat pacing: announce and then final result after the overlay duration.
+    const frames = Array.isArray(result.events) ? result.events : [];
+    const duelMs = Math.min(18000, Math.max(3500, frames.reduce((acc,f)=>acc + (Number(f?.durationMs)||1000), 0) + 600));
+
+    try {
+      await refreshKickTokenIfNeeded();
+      await sendKickChatMessage(`⚔️ DUEL! ${req.challengerName} (${result.challengerMon.name}) vs ${username} (${result.opponentMon.name})`);
+    } catch {}
+
+    setTimeout(async () => {
+      try {
+        const winner = result.result === "challenger" ? req.challengerName : username;
+        await sendKickChatMessage(`🏆 ${winner} wins the duel!`);
+      } catch {}
+    }, duelMs);
+
+    return;
+  }
+
   // !bet <amount>  (alias: !wager)
   // Instant wager: deduct leaderpoints, then immediately attempt to catch the current spawn.
   if (lower.startsWith(`${PREFIX}bet`) || lower.startsWith(`${PREFIX}wager`)) {
@@ -1513,13 +1583,6 @@ async function handleChat({ username, userId, content }) {
       try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`Usage: ${PREFIX}bet <amount>`); } catch {}
       return;
     }
-
-    // Apply the same 1.5s cooldown as !catch
-    const cdKey = userId ? `kick:${String(userId)}` : `kick:${String(username || "").toLowerCase()}`;
-    const now = Date.now();
-    const last = lastCatchAttemptAt.get(cdKey) || 0;
-    if (now - last < CATCH_COOLDOWN_MS) return;
-    lastCatchAttemptAt.set(cdKey, now);
 
     const spawn = await game.getActiveSpawn();
     if (!spawn) {
@@ -1602,49 +1665,11 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
-  // !sound on|off  /  !sound volume <0-100>
+  // Sound controls are disabled for now.
   if (lower.startsWith(`${PREFIX}sound`)) {
-    // streamer-only controls
     if (String(username || "").toLowerCase() !== STREAMER_USERNAME) return;
-
-    const parts = msg.trim().split(/\s+/);
-    const sub = (parts[1] || "").toLowerCase();
-
-    if (!sub || sub === "status") {
-      const cur = await getSoundSettings(PRIMARY_CHANNEL);
-      try {
-        await refreshKickTokenIfNeeded();
-        await sendKickChatMessage(`🔊 Sound: ${cur.enabled ? "ON" : "OFF"} | volume: ${Math.round(cur.volume * 100)}%`);
-      } catch {}
-      return;
-    }
-
-    if (sub === "on" || sub === "off") {
-      const cur = await setSoundSettings(PRIMARY_CHANNEL, { enabled: sub === "on" });
-      try {
-        await refreshKickTokenIfNeeded();
-        await sendKickChatMessage(`🔊 Sound is now ${cur.enabled ? "ON" : "OFF"}.`);
-      } catch {}
-      return;
-    }
-
-    if (sub === "volume" || sub === "vol") {
-      const raw = parts[2];
-      const pct = Number(raw);
-      if (!Number.isFinite(pct)) {
-        try {
-          await refreshKickTokenIfNeeded();
-          await sendKickChatMessage("Usage: !sound volume <0-100>");
-        } catch {}
-        return;
-      }
-      const cur = await setSoundSettings(PRIMARY_CHANNEL, { volume: Math.max(0, Math.min(1, pct / 100)) });
-      try {
-        await refreshKickTokenIfNeeded();
-        await sendKickChatMessage(`🔊 Volume set to ${Math.round(cur.volume * 100)}%.`);
-      } catch {}
-      return;
-    }
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage("🔇 Overlay sounds are currently disabled."); } catch {}
+    return;
   }
 
   // !spawn (streamer-only)

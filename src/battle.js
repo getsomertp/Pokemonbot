@@ -83,8 +83,15 @@ function calcDamage({
   const atkPh = Number(attacker.stats?.atk ?? 1);
   const defPh = Number(defender.stats?.def ?? 1);
 
-  const A = cls === "special" ? atkSp : atkPh;
+  let A = cls === "special" ? atkSp : atkPh;
   const D = cls === "special" ? defSp : defPh;
+
+  // --- Status modifiers (Gen-1-ish, simplified) ---
+  // Burn halves physical attack.
+  const status = String(attacker.status || "").toLowerCase();
+  if (status === "burn" && cls !== "special") {
+    A = Math.max(1, Math.floor(A * 0.5));
+  }
 
   const levelFactor = Math.floor((2 * lvl) / 5) + 2;
   const base = Math.floor(Math.floor((levelFactor * power * Math.max(1, A)) / Math.max(1, D)) / 50) + 2;
@@ -97,6 +104,54 @@ function calcDamage({
 
   const dmg = Math.max(1, Math.floor(base * stab * mult * critMult * rand));
   return { damage: mult === 0 ? 0 : dmg, hit: true, crit, mult };
+}
+
+// --- Simplified status system ---
+// We don't have full Gen-1 move metadata (chances/effects), so we map a few classic moves.
+// This is intentionally minimal and can be expanded later.
+const STATUS_BY_MOVE = {
+  // Burn (chance)
+  "ember": { status: "burn", chance: 0.10 },
+  "flamethrower": { status: "burn", chance: 0.10 },
+  "fire-blast": { status: "burn", chance: 0.30 },
+  // Poison (chance)
+  "poison-sting": { status: "poison", chance: 0.20 },
+  "smog": { status: "poison", chance: 0.40 },
+  "sludge": { status: "poison", chance: 0.30 },
+};
+
+function maybeInflictStatus({ attackerSide, defenderSide, attacker, defender, move, hit, mult, rng, pushEvent }) {
+  if (!hit || mult === 0) return;
+  if (defender.hp <= 0) return;
+  if (defender.status) return; // one major status at a time (simplified)
+
+  const key = String(move?.name || "").trim().toLowerCase();
+  const rule = STATUS_BY_MOVE[key];
+  if (!rule) return;
+
+  const roll = (rng || defaultRng)();
+  if (roll > rule.chance) return;
+
+  defender.status = rule.status;
+  const nice = rule.status === "burn" ? "burned" : rule.status;
+  pushEvent(`${defender.name} was ${nice}!`, { kind: "status_inflict", attacker: attackerSide, defender: defenderSide, status: rule.status, moveName: move?.name }, 1200);
+}
+
+function statusTick({ side, mon, rng, pushEvent }) {
+  if (!mon?.status) return;
+  if (mon.hp <= 0) return;
+  const st = String(mon.status).toLowerCase();
+  if (st !== "burn" && st !== "poison") return;
+
+  const dmg = Math.max(1, Math.floor(mon.maxHP / 8));
+  const before = mon.hp;
+  const after = Math.max(0, mon.hp - dmg);
+  mon.hp = after;
+
+  const msg = st === "burn" ? `${mon.name} is hurt by its burn!` : `${mon.name} is hurt by poison!`;
+  pushEvent(msg, { kind: "status_tick", defender: side, status: st, damage: dmg, hpFrom: before, hpTo: after }, 1400);
+  // Impact beat for HP bar ticking + shake/flash
+  pushEvent("", { kind: "impact", attacker: null, defender: side, status: st, damage: dmg, hpFrom: before, hpTo: after }, 650);
 }
 
 function chooseMove(poke, rng) {
@@ -118,6 +173,8 @@ function simulateBattle(a, b, rng = defaultRng) {
   right.maxHP = Number(right.stats?.hp || 1);
   left.hp = left.maxHP;
   right.hp = right.maxHP;
+  left.status = left.status || null;
+  right.status = right.status || null;
 
   const log = [];
   const events = [];
@@ -215,6 +272,9 @@ function simulateBattle(a, b, rng = defaultRng) {
       // 4) Text beat: show damage as a separate line (you asked to show damage done)
       pushEvent(`It dealt ${res.damage} damage!`, { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: !!res.crit, mult: res.mult }, 1300);
 
+      // Optional simplified status inflict (burn/poison) after a successful damaging hit
+      maybeInflictStatus({ attackerSide: attSide, defenderSide: defSide, attacker: att, defender: def, move: mv, hit: true, mult: res.mult, rng, pushEvent });
+
       // 5) Crit / effectiveness as their own lines, like the games
       if (res.crit) {
         pushEvent("A critical hit!", { kind: "hit", attacker: attSide, defender: defSide, moveName: mv.name, damage: res.damage, crit: true, mult: res.mult }, 1100);
@@ -241,6 +301,19 @@ function simulateBattle(a, b, rng = defaultRng) {
         pushEvent(`${def.name} fainted!`, { kind: "faint", attacker: attSide, defender: defSide }, 1400);
         break;
       }
+    }
+
+    // End-of-turn status ticks (between turns, like Pokémon)
+    if (left.hp > 0) statusTick({ side: "L", mon: left, rng, pushEvent });
+    if (right.hp > 0) statusTick({ side: "R", mon: right, rng, pushEvent });
+
+    // KO check after status
+    if (left.hp <= 0 || right.hp <= 0) {
+      const dead = left.hp <= 0 ? left : right;
+      const deadSide = left.hp <= 0 ? "L" : "R";
+      pushEvent("", { kind: "pause" }, 650);
+      pushEvent(`${dead.name} fainted!`, { kind: "faint", attacker: null, defender: deadSide }, 1400);
+      break;
     }
   }
 

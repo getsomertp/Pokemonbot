@@ -434,6 +434,31 @@ class Game {
       catch: result.catch
     };
   }
+
+  /**
+   * Trainer vs Trainer battle (1 Pokémon each, for now).
+   * No catching occurs. Returns simulation events for the overlay.
+   */
+  async battleTrainers({ challengerUserId, challengerName, opponentUserId, opponentName }) {
+    const aMon = await this.getUserBattleMon(challengerUserId);
+    const bMon = await this.getUserBattleMon(opponentUserId);
+    if (!aMon || !bMon) {
+      return { ok: false, reason: "no_team" };
+    }
+
+    const sim = simulateBattle(aMon, bMon);
+    const aWon = sim.winner === "left";
+    return {
+      ok: true,
+      result: aWon ? "challenger" : "opponent",
+      winnerName: aWon ? (challengerName || aMon.name) : (opponentName || bMon.name),
+      loserName: aWon ? (opponentName || bMon.name) : (challengerName || aMon.name),
+      challengerMon: sim.left,
+      opponentMon: sim.right,
+      events: sim.events,
+      log: sim.log
+    };
+  }
 }
 
 module.exports = { Game };
