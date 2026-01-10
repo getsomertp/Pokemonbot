@@ -212,13 +212,17 @@ class Game {
         data: { caughtAt: now, caughtBy: user.id }
       });
 
-      
+      // Initialize persistent HP on catch using stored spawn stats when possible.
+      let hpMax = 0;
+      try {
+        hpMax = Math.floor(Number(spawn.statsJson?.hp || 0));
+      } catch {}
+      if (!hpMax) {
+        const rebuilt = buildBattleMonFromDex({ nameOrId: spawn.pokemonId || spawn.pokemon, level: spawn.level || 5 });
+        hpMax = Math.floor(Number(rebuilt?.stats?.hp || 0));
+      }
 
-// Compute and store persistent HP for this caught Pokémon instance
-const caughtMon = buildBattleMonFromDex({ nameOrId: spawn.pokemon, level: spawn.level || 5 });
-const maxHp = Number(caughtMon?.stats?.hp || 1);
-
-const c = await tx.catch.create({
+      const c = await tx.catch.create({
         data: {
           userId: user.id,
           spawnId: spawn.id,
@@ -226,8 +230,8 @@ const c = await tx.catch.create({
           tier: spawn.tier,
           isShiny: spawn.isShiny,
           level: spawn.level, // ✅ saved for history/PvP selection later
-          maxHp,
-          currentHp: maxHp,
+          hpMax: hpMax || null,
+          hpCurrent: hpMax || null,
           pointsEarned,
           speedMs
         }
@@ -333,12 +337,13 @@ const c = await tx.catch.create({
 
     const lvl = pick.level || 5;
     const mon = buildBattleMonFromDex({ nameOrId: pick.pokemon, level: lvl });
+    if (!mon) return null;
 
-    // Persistent HP between battles (falls back to full HP if not set)
-    const maxHP = Number(pick.maxHp || mon.stats?.hp || 1);
-    const hp = Number(pick.currentHp);
+    // Persistent HP: if missing (legacy rows), treat as full health.
+    const maxHP = Number(mon.stats?.hp || 1);
+    const curHP = Number(pick.hpCurrent);
+    mon.hp = Number.isFinite(curHP) && curHP > 0 ? Math.min(Math.max(1, Math.floor(curHP)), maxHP) : maxHP;
     mon.maxHP = maxHP;
-    mon.hp = Number.isFinite(hp) ? Math.max(0, Math.min(maxHP, Math.trunc(hp))) : maxHP;
 
     return { mon, catchRow: pick };
   }
@@ -352,10 +357,10 @@ const c = await tx.catch.create({
     if (!spawn) return { ok: false, reason: "no_spawn" };
 
     const user = await this.getOrCreateKickUser(username, platformUserId);
-    const sel = await this.getUserBattleMon(user.id);
-    if (!sel) return { ok: false, reason: "no_team" };
-    const userMon = sel.mon;
-    const userCatch = sel.catchRow;
+    const picked = await this.getUserBattleMon(user.id);
+    if (!picked?.mon || !picked?.catchRow) return { ok: false, reason: "no_team" };
+    const userMon = picked.mon;
+    const userCatch = picked.catchRow;
 
     // Build wild mon from stored spawn stats/moves if available, else from dex.
     // NOTE: Prisma JSON fields can contain empty arrays/objects; treat those as "missing".
@@ -384,22 +389,16 @@ const c = await tx.catch.create({
     const sim = simulateBattle(userMon, wild, undefined, { mode: "wild", leftTrainerName: username, rightTrainerName: "Wild" });
     const userWon = sim.winner === "left";
 
-
-// Persist battle damage for the user's Pokémon so HP carries between battles.
-// If it faints (<= 0 HP), remove it from the trainer's inventory.
-if (userCatch?.id) {
-  if (Number(sim.left.hp) <= 0) {
-    await prisma.catch.delete({ where: { id: userCatch.id } }).catch(() => {});
-  } else {
-    await prisma.catch
-      .update({
-        where: { id: userCatch.id },
-        data: { currentHp: sim.left.hp, maxHp: sim.left.maxHP }
-      })
-      .catch(() => {});
-  }
-}
-
+    // Persist HP for the user's active Pokémon (and delete if it fainted).
+    try {
+      const newHp = Math.max(0, Math.floor(Number(sim.left?.hp ?? 0)));
+      const newMax = Math.floor(Number(sim.left?.maxHP ?? 0)) || null;
+      if (newHp <= 0) {
+        await prisma.catch.delete({ where: { id: userCatch.id } }).catch(() => {});
+      } else {
+        await prisma.catch.update({ where: { id: userCatch.id }, data: { hpCurrent: newHp, hpMax: newMax } }).catch(() => {});
+      }
+    } catch {}
 
     if (!userWon) {
       return {
@@ -439,12 +438,16 @@ if (userCatch?.id) {
       pointsEarned += Math.floor((spawn.level || 5) / 5);
       pointsEarned += battleBonus;
 
-      
+      let hpMax = 0;
+      try {
+        hpMax = Math.floor(Number(spawn.statsJson?.hp || 0));
+      } catch {}
+      if (!hpMax) {
+        const rebuilt = buildBattleMonFromDex({ nameOrId: spawn.pokemonId || spawn.pokemon, level: spawn.level || 5 });
+        hpMax = Math.floor(Number(rebuilt?.stats?.hp || 0));
+      }
 
-const battleCaughtMon = buildBattleMonFromDex({ nameOrId: spawn.pokemon, level: spawn.level || 5 });
-const battleMaxHp = Number(battleCaughtMon?.stats?.hp || 1);
-
-const c = await tx.catch.create({
+      const c = await tx.catch.create({
         data: {
           userId: user.id,
           spawnId: spawn.id,
@@ -452,8 +455,8 @@ const c = await tx.catch.create({
           tier: spawn.tier,
           isShiny: spawn.isShiny,
           level: spawn.level,
-          maxHp: battleMaxHp,
-          currentHp: battleMaxHp,
+          hpMax: hpMax || null,
+          hpCurrent: hpMax || null,
           pointsEarned,
           speedMs
         }
@@ -481,36 +484,30 @@ const c = await tx.catch.create({
    * No catching occurs. Returns simulation events for the overlay.
    */
   async battleTrainers({ challengerUserId, challengerName, opponentUserId, opponentName }) {
-    const selA = await this.getUserBattleMon(challengerUserId);
-    const selB = await this.getUserBattleMon(opponentUserId);
-    if (!selA || !selB) {
-
+    const aPick = await this.getUserBattleMon(challengerUserId);
+    const bPick = await this.getUserBattleMon(opponentUserId);
+    const aMon = aPick?.mon;
+    const bMon = bPick?.mon;
+    if (!aMon || !bMon || !aPick?.catchRow || !bPick?.catchRow) {
       return { ok: false, reason: "no_team" };
     }
-
-    const aMon = selA.mon;
-    const bMon = selB.mon;
-    const aCatch = selA.catchRow;
-    const bCatch = selB.catchRow;
 
     const sim = simulateBattle(aMon, bMon, undefined, { mode: "trainer", leftTrainerName: challengerName, rightTrainerName: opponentName });
     const aWon = sim.winner === "left";
 
-// Persist battle damage for both trainers so HP carries between battles.
-// If a Pokémon faints (<= 0 HP), remove it from that trainer's inventory.
-await Promise.all([
-  aCatch?.id
-    ? (Number(sim.left.hp) <= 0
-        ? prisma.catch.delete({ where: { id: aCatch.id } }).catch(() => {})
-        : prisma.catch.update({ where: { id: aCatch.id }, data: { currentHp: sim.left.hp, maxHp: sim.left.maxHP } }).catch(() => {}))
-    : null,
-  bCatch?.id
-    ? (Number(sim.right.hp) <= 0
-        ? prisma.catch.delete({ where: { id: bCatch.id } }).catch(() => {})
-        : prisma.catch.update({ where: { id: bCatch.id }, data: { currentHp: sim.right.hp, maxHp: sim.right.maxHP } }).catch(() => {}))
-    : null
-]);
-
+    // Persist HP for both trainers' active Pokémon (delete if fainted).
+    try {
+      const aHp = Math.max(0, Math.floor(Number(sim.left?.hp ?? 0)));
+      const aMax = Math.floor(Number(sim.left?.maxHP ?? 0)) || null;
+      if (aHp <= 0) await prisma.catch.delete({ where: { id: aPick.catchRow.id } }).catch(() => {});
+      else await prisma.catch.update({ where: { id: aPick.catchRow.id }, data: { hpCurrent: aHp, hpMax: aMax } }).catch(() => {});
+    } catch {}
+    try {
+      const bHp = Math.max(0, Math.floor(Number(sim.right?.hp ?? 0)));
+      const bMax = Math.floor(Number(sim.right?.maxHP ?? 0)) || null;
+      if (bHp <= 0) await prisma.catch.delete({ where: { id: bPick.catchRow.id } }).catch(() => {});
+      else await prisma.catch.update({ where: { id: bPick.catchRow.id }, data: { hpCurrent: bHp, hpMax: bMax } }).catch(() => {});
+    } catch {}
     return {
       ok: true,
       result: aWon ? "challenger" : "opponent",

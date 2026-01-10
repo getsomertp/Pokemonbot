@@ -332,7 +332,14 @@ function ensureDbSchema() {
       msg.includes("migrations directory") && msg.includes("not found");
 
     if (noMigrations) {
-      console.warn("⚠️ No Prisma migrations to deploy yet; continuing without applying migrations.");
+      console.warn("⚠️ No Prisma migrations found. Running `prisma db push` to sync schema (safe for added columns).");
+      try {
+        const out2 = execSync("npx prisma db push", { encoding: "utf8" });
+        if (out2) process.stdout.write(out2);
+        console.log("✅ prisma db push complete");
+      } catch (e2) {
+        console.warn("⚠️ prisma db push failed; continuing to boot. Some features may not work until schema is applied.");
+      }
       return;
     }
 
@@ -775,12 +782,23 @@ app.get("/trainer/:username", async (req, res) => {
     const tier = _escHtml(c.tier || "");
     const shiny = c.isShiny ? "✨" : "";
     const caught = c.caughtAt ? new Date(c.caughtAt).toISOString().slice(0, 10) : "";
+    // HP display (persisted between battles). For legacy rows with null HP, estimate from dex+level.
+    let hpMax = c.hpMax != null ? Number(c.hpMax) : null;
+    let hpCur = c.hpCurrent != null ? Number(c.hpCurrent) : null;
+    try {
+      if ((!hpMax || hpMax <= 0) && entry && c.level) {
+        const stats = dex.computeStats(entry.baseStats, Number(c.level));
+        hpMax = Number(stats?.hp || 0) || hpMax;
+      }
+    } catch {}
+    if (!hpCur && hpMax) hpCur = hpMax;
+    const hpTag = hpMax ? `HP ${Math.max(0, Math.floor(hpCur ?? hpMax))}/${Math.floor(hpMax)}` : "HP ?";
     return `
       <div class="card">
         <div class="art">${art ? `<img loading="lazy" src="${art}" alt="${name}"/>` : `<div class="noart">?</div>`}</div>
         <div class="info">
           <div class="title">${shiny} ${name}</div>
-          <div class="meta">Lv ${lvl} • HP ${(c.currentHp ?? c.maxHp) != null ? String(c.currentHp ?? c.maxHp) + "/" + String(c.maxHp ?? c.currentHp) : "—"} • ${tier || "—"} • ${caught}</div>
+          <div class="meta">Lv ${lvl} • ${tier || "—"} • ${hpTag} • ${caught}</div>
         </div>
       </div>
     `;
@@ -1658,6 +1676,26 @@ async function handleChat({ username, userId, content }) {
   lastCommandAt.set(cdKey, now);
 
   const lower = msg.toLowerCase();
+
+  // !pokehelp  (prints a clean command list)
+  if (lower === `${PREFIX}pokehelp` || lower === `${PREFIX}help`) {
+    const p = PREFIX;
+    const lines = [
+      `Commands:`,
+      `Catch: ${p}catch`,
+      `Battle: ${p}battle`,
+      `Bet (catch+multiplier): ${p}bet <amount>`,
+      `Inventory: ${p}inv`,
+      `Pick active mon: ${p}use <pokemon>`,
+      `Heal active mon (200 pts): ${p}heal`,
+      `Stats: ${p}me`,
+      `LeaderPts Top: ${p}top`,
+      `Catches Top: ${p}pokelb`,
+      `PvP: ${p}duel <user> / ${p}accept / ${p}decline`
+    ];
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(lines.join(" | ")); } catch {}
+    return;
+  }
   // !catch  (optional: !catch <name>)
   if (lower === `${PREFIX}catch` || lower.startsWith(`${PREFIX}catch `)) {
     const guess = lower === `${PREFIX}catch` ? "" : msg.slice(`${PREFIX}catch `.length);
@@ -1814,7 +1852,12 @@ async function handleChat({ username, userId, content }) {
       return;
     }
     const list = recent
-      .map((c) => `${c.isShiny ? "✨" : ""}${c.pokemon}${c.level ? " Lv." + c.level : ""}`)
+      .map((c) => {
+        const hpMax = c.hpMax != null ? Number(c.hpMax) : null;
+        const hpCur = c.hpCurrent != null ? Number(c.hpCurrent) : null;
+        const hpTag = hpMax ? ` (HP ${Math.max(0, Math.floor(hpCur ?? hpMax))}/${Math.floor(hpMax)})` : "";
+        return `${c.isShiny ? "✨" : ""}${c.pokemon}${c.level ? " Lv." + c.level : ""}${hpTag}`;
+      })
       .join(", ");
     const baseUrl = process.env.PUBLIC_BASE_URL;
     const invLink = baseUrl ? `${baseUrl.replace(/\/$/, "")}/trainer/${String(username).toLowerCase()}` : null;
@@ -1825,65 +1868,7 @@ async function handleChat({ username, userId, content }) {
     return;
   }
 
-  
-// !heal [pokemon]  (spend LeaderPoints to heal a Pokémon to full; HP persists between battles)
-if (lower === `${PREFIX}heal` || lower.startsWith(`${PREFIX}heal `)) {
-  const arg = msg.split(/\s+/).slice(1).join(" ").trim();
-  const user = await game.getOrCreateKickUser(username, userId);
-
-  const cost = envInt("HEAL_COST_LP", 250);
-  const leaderPts = await getLeaderPoints(user.id);
-  if (leaderPts < cost) {
-    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`🧪 ${username} — you need ${cost} LeaderPts to heal (you have ${leaderPts}).`); } catch {}
-    return;
-  }
-
-  // Pick target Pokémon instance to heal:
-  // - If arg provided: heal your highest level of that species (or by catch id if you paste it)
-  // - Otherwise: heal your currently selected battle Pokémon (via !use), or your highest level catch
-  let target = null;
-  if (arg) {
-    const rows = await prisma.catch.findMany({
-      where: { userId: user.id },
-      orderBy: [{ level: "desc" }, { caughtAt: "desc" }],
-      take: 200
-    });
-    const a = arg.toLowerCase();
-    target = rows.find((r) => String(r.id).toLowerCase() === a) ||
-             rows.find((r) => String(r.pokemon || "").toLowerCase() === a) ||
-             null;
-  } else {
-    const sel = await game.getUserBattleMon(user.id);
-    target = sel?.catchRow || null;
-  }
-
-  if (!target) {
-    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`🧪 ${username} — you don't have any Pokémon to heal yet.`); } catch {}
-    return;
-  }
-
-  const maxHp = Number(target.maxHp || 0);
-  if (!Number.isFinite(maxHp) || maxHp <= 0) {
-    // Backfill max HP if older catches existed before HP persistence was added
-    const rebuilt = require("./battle").buildBattleMonFromDex({ nameOrId: target.pokemon, level: target.level || 5 });
-    const mhp = Number(rebuilt?.stats?.hp || 1);
-    await prisma.catch.update({ where: { id: target.id }, data: { maxHp: mhp, currentHp: mhp } }).catch(() => {});
-  } else {
-    await prisma.catch.update({ where: { id: target.id }, data: { currentHp: maxHp } }).catch(() => {});
-  }
-
-  // Deduct currency via adjustment
-  const adj = await getLpAdj(user.id);
-  await setLpAdj(user.id, adj - cost);
-
-  try {
-    await refreshKickTokenIfNeeded();
-    await sendKickChatMessage(`💚 ${username} healed ${target.isShiny ? "✨" : ""}${target.pokemon}${target.level ? " Lv." + target.level : ""} to full for ${cost} LeaderPts!`);
-  } catch {}
-  return;
-}
-
-// !use <pokemon>  (sets your active battle Pokémon; picks your highest level of that species)
+  // !use <pokemon>  (sets your active battle Pokémon; picks your highest level of that species)
   if (lower === `${PREFIX}use` || lower.startsWith(`${PREFIX}use `) || lower === `${PREFIX}pick` || lower.startsWith(`${PREFIX}pick `)) {
     const arg = msg.split(/\s+/).slice(1).join(" ").trim();
     const user = await game.getOrCreateKickUser(username, userId);
@@ -1902,6 +1887,42 @@ if (lower === `${PREFIX}heal` || lower.startsWith(`${PREFIX}heal `)) {
 
     await game.setActivePokemon(user.id, arg);
     try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — set active battle Pokémon to ${owned.pokemon}${owned.level ? ` (best Lv.${owned.level})` : ""}.`); } catch {}
+    return;
+  }
+
+  // !heal  (heal your active Pokémon to full for 200 leaderpoints)
+  if (lower === `${PREFIX}heal` || lower === `${PREFIX}pokeheal` || lower === `${PREFIX}pokecenter`) {
+    const user = await game.getOrCreateKickUser(username, userId);
+    const picked = await game.getUserBattleMon(user.id);
+    if (!picked?.mon || !picked?.catchRow) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — you have no Pokémon to heal yet.`); } catch {}
+      return;
+    }
+
+    const maxHP = Math.floor(Number(picked.mon.maxHP ?? picked.mon.stats?.hp ?? 0)) || 0;
+    const curHP = Math.floor(Number(picked.catchRow.hpCurrent ?? maxHP)) || 0;
+
+    if (!maxHP) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — couldn't read that Pokémon's HP. Try again.`); } catch {}
+      return;
+    }
+
+    if (curHP >= maxHP) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — ${picked.catchRow.pokemon} is already full HP (${maxHP}/${maxHP}).`); } catch {}
+      return;
+    }
+
+    const cost = 200;
+    const pts = await getLeaderPoints(user.id);
+    if (pts < cost) {
+      try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`${username} — need ${cost} leaderpoints to heal. You have ${pts}.`); } catch {}
+      return;
+    }
+
+    await addLpAdj(user.id, -cost);
+    await prisma.catch.update({ where: { id: picked.catchRow.id }, data: { hpMax: maxHP, hpCurrent: maxHP } }).catch(() => {});
+
+    try { await refreshKickTokenIfNeeded(); await sendKickChatMessage(`💊 ${username} healed ${picked.catchRow.pokemon} to full HP (${maxHP}/${maxHP}) for ${cost} pts.`); } catch {}
     return;
   }
 

@@ -79,8 +79,10 @@ model Catch {
   level        Int?     
 
   // Persistent HP between battles
-  maxHp       Int?
-  currentHp   Int?
+  // - hpMax: max HP at this Pokémon's current level
+  // - hpCurrent: current HP that persists between battles
+  hpMax        Int?
+  hpCurrent    Int?
 
   pointsEarned Int
   speedMs      Int
