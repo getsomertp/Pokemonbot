@@ -214,31 +214,27 @@ function simulateBattle(a, b, rng = defaultRng) {
   pushEvent(`A wild ${right.name} appeared!`, { kind: "start", defender: "R" }, 1500);
   pushEvent(`Go! ${left.name}!`, { kind: "sendout", attacker: "L" }, 1500);
 
+  // --- Turn order ---
+  // Viewers expect an obvious back-and-forth: X attacks, then Y attacks, etc.
+  // Decide who starts ONCE based on Speed (Gen-1 style), then strictly alternate turns.
+  // (This prevents the battle from *feeling* like one side is taking multiple turns.)
+  const lSpe0 = Number(left.stats?.spe ?? left.stats?.speed ?? left.stats?.spd ?? 1);
+  const rSpe0 = Number(right.stats?.spe ?? right.stats?.speed ?? right.stats?.spd ?? 1);
+  const starter = lSpe0 !== rSpe0 ? (lSpe0 > rSpe0 ? "L" : "R") : (rng() < 0.5 ? "L" : "R");
+  const other = starter === "L" ? "R" : "L";
+
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (left.hp <= 0 || right.hp <= 0) break;
 
-    const lMove = chooseMove(left, rng);
-    const rMove = chooseMove(right, rng);
+    // Fixed order for this full turn: starter then other
+    const order = starter === "L"
+      ? [["L", left, "R", right], ["R", right, "L", left]]
+      : [["R", right, "L", left], ["L", left, "R", right]];
 
-    // Determine order: priority then speed then coin flip
-    const lPri = Number(lMove?.priority || 0);
-    const rPri = Number(rMove?.priority || 0);
-    const lSpe = Number(left.stats?.spe || left.stats?.spd || 1);
-    const rSpe = Number(right.stats?.spe || right.stats?.spd || 1);
-
-    const first =
-      lPri !== rPri
-        ? (lPri > rPri ? "L" : "R")
-        : lSpe !== rSpe
-          ? (lSpe > rSpe ? "L" : "R")
-          : (rng() < 0.5 ? "L" : "R");
-
-    const order = first === "L"
-      ? [["L", left, "R", right, lMove], ["R", right, "L", left, rMove]]
-      : [["R", right, "L", left, rMove], ["L", left, "R", right, lMove]];
-
-    for (const [attSide, att, defSide, def, mv] of order) {
+    for (const [attSide, att, defSide, def] of order) {
       if (att.hp <= 0 || def.hp <= 0) continue;
+
+      const mv = chooseMove(att, rng);
       if (!mv) continue;
 
       // --- Mainline-style move sequence ---
